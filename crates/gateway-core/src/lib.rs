@@ -1,5 +1,6 @@
 //! Shared, transport-neutral `ModelForge` Clinical MCP admission boundary.
 
+mod audit;
 mod catalog;
 mod contracts;
 mod digest;
@@ -16,6 +17,7 @@ mod response_contract;
 mod router;
 mod runtime;
 
+pub use audit::FileAuditSink;
 pub use catalog::{CATALOG_VERSION, catalog, catalog_entry};
 pub use contracts::{
     AdmissionRequest, AuditEvent, AuditOutcome, CatalogEntry, ContextGrant, DestinationClass,

@@ -12,13 +12,13 @@ use async_trait::async_trait;
 use modelforge_clinical_mcp_core::{
     AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, BuiltInMedicationConflictService,
     CatalogEntry, ClinicalDomainAdapter, ClinicalPromptTemplate, ContextGrant, DestinationClass,
-    DomainAdapter, DomainRouter, EgressClass, Gateway, GatewayError, GrantResolver, GrantSnapshot,
-    MedicationCheckStatus, MedicationConflictRequest, MedicationConflictResult,
+    DomainAdapter, DomainRouter, EgressClass, FileAuditSink, Gateway, GatewayError, GrantResolver,
+    GrantSnapshot, MedicationCheckStatus, MedicationConflictRequest, MedicationConflictResult,
     MedicationConflictService, MedicationConflictWarning, MedicationConflictWarningKind,
-    PolicyEngine, PolicySet, PolicySnapshot, RuntimeBackendDiagnostics, RuntimeDiagnosticsResult,
-    RuntimeDiagnosticsService, RuntimeDomainAdapter, RuntimeLifecycleState, SubjectContext,
-    TenantPolicy, ToolEntitlement, catalog, check_response_contract_compliance,
-    clinical_response_contract_prompt, operation_digest,
+    PolicyEngine, PolicySet, PolicySnapshot, RiskClass, RuntimeBackendDiagnostics,
+    RuntimeDiagnosticsResult, RuntimeDiagnosticsService, RuntimeDomainAdapter,
+    RuntimeLifecycleState, SubjectContext, TenantPolicy, ToolEntitlement, catalog,
+    check_response_contract_compliance, clinical_response_contract_prompt, operation_digest,
 };
 use serde_json::{Value, json};
 
@@ -379,6 +379,44 @@ fn prompt_templates_append_mode_instruction_after_the_response_contract() {
 
     let compute_triage = ClinicalPromptTemplate::ComputeIncidentTriage.render();
     assert!(compute_triage.contains("bounded runtime diagnostics"));
+}
+
+#[tokio::test]
+async fn file_audit_sink_appends_one_json_line_per_event_and_excludes_no_field() {
+    let path = std::env::temp_dir().join(format!(
+        "modelforge-audit-test-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let sink = FileAuditSink::open(&path).await.expect("open audit file");
+
+    let event = AuditEvent {
+        operation_id: uuid::Uuid::new_v4(),
+        subject_id: "clinician-7".into(),
+        client_id: "desktop-2".into(),
+        organization_id: "org-3".into(),
+        tool_name: "clinical.medication_conflict_check".into(),
+        risk: RiskClass::ReadOnly,
+        outcome: AuditOutcome::Succeeded,
+        policy_version: Some("tools-1".into()),
+        error_class: None,
+    };
+    sink.record(event.clone()).await.expect("record event");
+    sink.record(event.clone())
+        .await
+        .expect("record second event");
+
+    let contents = tokio::fs::read_to_string(&path)
+        .await
+        .expect("read audit file");
+    tokio::fs::remove_file(&path)
+        .await
+        .expect("clean up audit file");
+    let lines = contents.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        let parsed: AuditEvent = serde_json::from_str(line).expect("valid JSON line");
+        assert_eq!(parsed, event);
+    }
 }
 
 fn medication_request(allergies: &[&str], medications: &[&str]) -> MedicationConflictRequest {
