@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CatalogEntry, ContextGrant, DestinationClass, GatewayError, PolicyEngine, PolicySnapshot,
-    SubjectContext, catalog_entry,
+    CatalogEntry, ContextGrant, DestinationClass, EgressClass, GatewayError, PolicyEngine,
+    PolicySnapshot, SubjectContext, catalog_entry,
 };
 
 const MAX_POLICY_VALUES: usize = 100;
@@ -19,6 +19,11 @@ pub struct ToolEntitlement {
     pub allowed_roles: BTreeSet<String>,
     pub required_scopes: BTreeSet<String>,
     pub allowed_destinations: BTreeSet<DestinationClass>,
+    /// Authentication strengths (the JWT `acr` claim) permitted to use this tool. Empty means
+    /// unrestricted: any authenticated subject may proceed regardless of step-up status. Set
+    /// this to require MFA/step-up (e.g. `{"urn:mfa"}`) for a specific PHI-bearing tool.
+    #[serde(default)]
+    pub allowed_authentication_strengths: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -64,6 +69,7 @@ impl PolicySet {
                 }
                 validate_values(&entitlement.allowed_roles)?;
                 validate_values(&entitlement.required_scopes)?;
+                validate_values(&entitlement.allowed_authentication_strengths)?;
             }
             let organization_id = policy.organization_id.clone();
             if tenants.insert(organization_id, policy).is_some() {
@@ -105,17 +111,38 @@ impl PolicyEngine for PolicySet {
         {
             return Err(GatewayError::PolicyDenied);
         }
+        if !entitlement.allowed_authentication_strengths.is_empty()
+            && !entitlement
+                .allowed_authentication_strengths
+                .contains(&subject.authentication_strength)
+        {
+            return Err(GatewayError::PolicyDenied);
+        }
         if operation.requires_context_grant() {
             let grant = grant.ok_or(GatewayError::PolicyDenied)?;
             if grant.purpose.trim().is_empty()
                 || !entitlement
                     .allowed_destinations
                     .contains(&grant.destination)
+                || !egress_permits(operation.egress, grant.destination)
             {
                 return Err(GatewayError::PolicyDenied);
             }
         }
         Ok(self.snapshot.clone())
+    }
+}
+
+/// Enforces the catalog's declared egress class against a grant's destination, independent of
+/// (and in addition to) the tenant-configured `allowed_destinations` allowlist: a tool the
+/// catalog marks as never egressing data must not be authorized for a grant that names a
+/// non-local destination, regardless of what a tenant policy misconfiguration might otherwise
+/// allow.
+fn egress_permits(egress: EgressClass, destination: DestinationClass) -> bool {
+    match egress {
+        EgressClass::None => destination == DestinationClass::LocalModelForge,
+        EgressClass::LocalOnly => destination != DestinationClass::ApprovedThirdParty,
+        EgressClass::ApprovedRemote => true,
     }
 }
 

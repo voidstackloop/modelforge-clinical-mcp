@@ -457,11 +457,13 @@ fn clinical_gateway(now: u64, service: Arc<TestMedicationService>) -> Arc<Gatewa
         allowed_roles: BTreeSet::from(["clinician".into()]),
         required_scopes: BTreeSet::from(["clinical:read".into()]),
         allowed_destinations: BTreeSet::from([DestinationClass::LocalModelForge]),
+        allowed_authentication_strengths: BTreeSet::new(),
     };
     let runtime_entitlement = ToolEntitlement {
         allowed_roles: BTreeSet::from(["clinician".into()]),
         required_scopes: BTreeSet::from(["runtime:read".into()]),
         allowed_destinations: BTreeSet::from([DestinationClass::LocalModelForge]),
+        allowed_authentication_strengths: BTreeSet::new(),
     };
     let policy = PolicySet::new(
         [TenantPolicy {
@@ -716,4 +718,102 @@ async fn runtime_diagnostics_tool_returns_bounded_summary_without_a_grant() {
     assert_eq!(backends[0]["backend"], "vllm");
     assert_eq!(backends[0]["state"], "running");
     assert_eq!(backends[0]["modelLoaded"], true);
+}
+
+#[tokio::test]
+async fn clinical_server_serves_prompts_and_capabilities_resource_like_bootstrap_does() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after Unix epoch")
+        .as_secs();
+    let service = Arc::new(TestMedicationService::default());
+    let app = build_clinical_router(
+        config(),
+        authenticator(AUDIENCE),
+        clinical_gateway(now, service),
+    )
+    .expect("build clinical router");
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "managed-test", "version": "1.0"},
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let auth_header = format!("Bearer {}", token(AUDIENCE));
+
+    let prompts_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::HOST, "mcp.test")
+        .header(header::ORIGIN, "https://app.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, &auth_header)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "prompts/list")
+        .body(Body::from(
+            json!({"jsonrpc":"2.0","id":12,"method":"prompts/list","params":{"_meta":meta}})
+                .to_string(),
+        ))
+        .expect("build prompts/list request");
+    let prompts_response = app
+        .clone()
+        .oneshot(prompts_request)
+        .await
+        .expect("router response");
+    assert_eq!(prompts_response.status(), StatusCode::OK);
+    let prompts_body = to_bytes(prompts_response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let prompts_payload: Value = serde_json::from_slice(&prompts_body).expect("parse response");
+    let prompt_names = prompts_payload["result"]["prompts"]
+        .as_array()
+        .expect("prompts array")
+        .iter()
+        .map(|prompt| prompt["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(prompt_names.contains(&"clinical.soap_draft"));
+
+    let resource_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::HOST, "mcp.test")
+        .header(header::ORIGIN, "https://app.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, &auth_header)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "resources/read")
+        .header("Mcp-Name", "modelforge://capabilities")
+        .body(Body::from(
+            json!({
+                "jsonrpc":"2.0",
+                "id":13,
+                "method":"resources/read",
+                "params":{"uri":"modelforge://capabilities","_meta":meta}
+            })
+            .to_string(),
+        ))
+        .expect("build resources/read request");
+    let resource_response = app
+        .oneshot(resource_request)
+        .await
+        .expect("router response");
+    let resource_status = resource_response.status();
+    let resource_body = to_bytes(resource_response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let resource_payload: Value = serde_json::from_slice(&resource_body).expect("parse response");
+    assert_eq!(
+        resource_status,
+        StatusCode::OK,
+        "resource response: {resource_payload}"
+    );
+    let text = resource_payload["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("resource text");
+    let manifest: Value = serde_json::from_str(text).expect("resource was not JSON");
+    assert_eq!(
+        manifest["tools"][0]["name"],
+        "clinical.medication_conflict_check"
+    );
 }

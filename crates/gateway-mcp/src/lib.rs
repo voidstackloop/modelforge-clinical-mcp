@@ -169,6 +169,39 @@ fn prompt_message(template: ClinicalPromptTemplate) -> Vec<PromptMessage> {
     vec![PromptMessage::new_text(Role::User, template.render())]
 }
 
+/// Shared by every server's `list_resources`: currently just the one V1 resource.
+fn list_capabilities_resource() -> ListResourcesResult {
+    ListResourcesResult::with_all_items(vec![
+        Resource::new(CAPABILITIES_RESOURCE_URI, "ModelForge capabilities")
+            .with_description(
+                "The deterministic, versioned ModelForge Clinical MCP capability manifest.",
+            )
+            .with_mime_type("application/json"),
+    ])
+}
+
+/// Shared by every server's `read_resource`. `enabled_tools` scopes the manifest the same way
+/// `capabilities_summary` does for the tool of the same name, so a resource read never reveals
+/// more than that server's own `tools/call` surface would.
+fn read_capabilities_resource(
+    uri: &str,
+    enabled_tools: &[&str],
+) -> Result<ReadResourceResponse, ErrorData> {
+    if uri != CAPABILITIES_RESOURCE_URI {
+        return Err(ErrorData::resource_not_found(
+            "unknown resource URI",
+            Some(serde_json::json!({ "uri": uri })),
+        ));
+    }
+    let summary = capabilities_summary(enabled_tools, true);
+    let text = serde_json::to_string(&summary)
+        .map_err(|_| ErrorData::internal_error("failed to encode capabilities", None))?;
+    Ok(ReadResourceResult::new(vec![
+        ResourceContents::text(text, CAPABILITIES_RESOURCE_URI).with_mime_type("application/json"),
+    ])
+    .into())
+}
+
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for BootstrapServer {
@@ -190,13 +223,7 @@ impl ServerHandler for BootstrapServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(vec![
-            Resource::new(CAPABILITIES_RESOURCE_URI, "ModelForge capabilities")
-                .with_description(
-                    "The deterministic, versioned ModelForge Clinical MCP capability manifest.",
-                )
-                .with_mime_type("application/json"),
-        ]))
+        Ok(list_capabilities_resource())
     }
 
     async fn read_resource(
@@ -204,20 +231,7 @@ impl ServerHandler for BootstrapServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        if request.uri != CAPABILITIES_RESOURCE_URI {
-            return Err(ErrorData::resource_not_found(
-                "unknown resource URI",
-                Some(serde_json::json!({"uri": request.uri})),
-            ));
-        }
-        let summary = capabilities_summary(&["modelforge.capabilities"], true);
-        let text = serde_json::to_string(&summary)
-            .map_err(|_| ErrorData::internal_error("failed to encode capabilities", None))?;
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(text, CAPABILITIES_RESOURCE_URI)
-                .with_mime_type("application/json"),
-        ])
-        .into())
+        read_capabilities_resource(&request.uri, &["modelforge.capabilities"])
     }
 }
 
@@ -233,6 +247,13 @@ impl ClinicalServer {
         Self { gateway }
     }
 }
+
+const CLINICAL_ENABLED_TOOLS: [&str; 4] = [
+    "clinical.medication_conflict_check",
+    "clinical.response_contract_check",
+    "modelforge.capabilities",
+    "runtime.diagnostics",
+];
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -268,12 +289,7 @@ impl ClinicalServer {
         Parameters(input): Parameters<CapabilitiesInput>,
     ) -> rmcp::Json<CapabilitySummary> {
         rmcp::Json(capabilities_summary(
-            &[
-                "clinical.medication_conflict_check",
-                "clinical.response_contract_check",
-                "modelforge.capabilities",
-                "runtime.diagnostics",
-            ],
+            &CLINICAL_ENABLED_TOOLS,
             input.include_descriptions,
         ))
     }
@@ -407,12 +423,96 @@ impl ClinicalServer {
     }
 }
 
+/// Same six V1 prompt templates as `BootstrapServer` (see its `#[prompt_router]` block for why:
+/// prompts carry no PHI and need no context grant, so the managed clinical server must expose
+/// them too, not just the unauthenticated bootstrap handler).
+#[prompt_router]
+impl ClinicalServer {
+    #[prompt(
+        name = "clinical.response_contract",
+        description = "The ModelForge structured eight-section clinical response contract, with no mode-specific instruction added."
+    )]
+    #[allow(clippy::unused_self)]
+    fn response_contract_prompt(&self) -> Vec<PromptMessage> {
+        prompt_message(ClinicalPromptTemplate::ResponseContract)
+    }
+
+    #[prompt(
+        name = "clinical.soap_draft",
+        description = "The response contract plus an instruction to draft a SOAP note (Subjective, Objective, Assessment, Plan)."
+    )]
+    #[allow(clippy::unused_self)]
+    fn soap_draft_prompt(&self) -> Vec<PromptMessage> {
+        prompt_message(ClinicalPromptTemplate::SoapDraft)
+    }
+
+    #[prompt(
+        name = "clinical.differential_support",
+        description = "The response contract plus an instruction to provide ranked differential diagnosis support."
+    )]
+    #[allow(clippy::unused_self)]
+    fn differential_support_prompt(&self) -> Vec<PromptMessage> {
+        prompt_message(ClinicalPromptTemplate::DifferentialSupport)
+    }
+
+    #[prompt(
+        name = "clinical.medication_review",
+        description = "The response contract plus an instruction to review medications for interactions, duplication, and dosing concerns."
+    )]
+    #[allow(clippy::unused_self)]
+    fn medication_review_prompt(&self) -> Vec<PromptMessage> {
+        prompt_message(ClinicalPromptTemplate::MedicationReview)
+    }
+
+    #[prompt(
+        name = "clinical.evidence_appraisal",
+        description = "The response contract plus an instruction to appraise supplied evidence sources for relevance, recency, and quality."
+    )]
+    #[allow(clippy::unused_self)]
+    fn evidence_appraisal_prompt(&self) -> Vec<PromptMessage> {
+        prompt_message(ClinicalPromptTemplate::EvidenceAppraisal)
+    }
+
+    #[prompt(
+        name = "clinical.compute_incident_triage",
+        description = "The response contract plus an instruction to triage a compute/runtime incident using only bounded runtime diagnostics."
+    )]
+    #[allow(clippy::unused_self)]
+    fn compute_incident_triage_prompt(&self) -> Vec<PromptMessage> {
+        prompt_message(ClinicalPromptTemplate::ComputeIncidentTriage)
+    }
+}
+
 #[tool_handler]
+#[prompt_handler]
 impl ServerHandler for ClinicalServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+        )
+        .with_instructions(
             "Read-only managed clinical gateway. Every PHI-bearing operation requires verified identity, tenant policy, and a short-lived context grant.",
         )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(list_capabilities_resource())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        read_capabilities_resource(&request.uri, &CLINICAL_ENABLED_TOOLS)
     }
 }
 

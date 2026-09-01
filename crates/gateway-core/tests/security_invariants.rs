@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use modelforge_clinical_mcp_core::{
     AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, CatalogEntry, ClinicalDomainAdapter,
-    ClinicalPromptTemplate, ContextGrant, DestinationClass, DomainAdapter, DomainRouter, Gateway,
-    GatewayError, GrantResolver, GrantSnapshot, MedicationConflictFinding,
+    ClinicalPromptTemplate, ContextGrant, DestinationClass, DomainAdapter, DomainRouter,
+    EgressClass, Gateway, GatewayError, GrantResolver, GrantSnapshot, MedicationConflictFinding,
     MedicationConflictRequest, MedicationConflictResult, MedicationConflictService, PolicyEngine,
     PolicySet, PolicySnapshot, RuntimeBackendDiagnostics, RuntimeDiagnosticsResult,
     RuntimeDiagnosticsService, RuntimeDomainAdapter, RuntimeLifecycleState, SubjectContext,
@@ -494,6 +494,36 @@ async fn grant_replay_by_another_subject_is_rejected_before_domain_call() {
 }
 
 #[tokio::test]
+async fn unknown_operation_still_emits_an_audit_event() {
+    let audit = Arc::new(MemoryAudit::default());
+    let gateway = Gateway::new(
+        Arc::new(AllowPolicy),
+        Arc::new(StaticGrant(medication_grant())),
+        Arc::new(EchoDomain),
+        audit.clone(),
+    );
+    let error = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: "clinical.does_not_exist".into(),
+            arguments: json!({}),
+            context_grant_id: None,
+            approval_ticket: None,
+            idempotency_key: None,
+            now_epoch_seconds: 1_000,
+        })
+        .await;
+    assert_eq!(error.err(), Some(GatewayError::UnknownOperation));
+    let events = audit
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].outcome, AuditOutcome::Denied);
+    assert_eq!(events[0].error_class.as_deref(), Some("unknown_operation"));
+}
+
+#[tokio::test]
 async fn oversized_input_is_rejected() {
     let gateway = Gateway::new(
         Arc::new(AllowPolicy),
@@ -535,6 +565,24 @@ fn tenant_policy() -> TenantPolicy {
                 allowed_roles: BTreeSet::from(["clinician".into()]),
                 required_scopes: BTreeSet::from(["clinical:read".into()]),
                 allowed_destinations: BTreeSet::from([DestinationClass::LocalModelForge]),
+                allowed_authentication_strengths: BTreeSet::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+fn step_up_tenant_policy() -> TenantPolicy {
+    TenantPolicy {
+        organization_id: "org-3".into(),
+        tools: [(
+            "clinical.medication_conflict_check".into(),
+            ToolEntitlement {
+                allowed_roles: BTreeSet::from(["clinician".into()]),
+                required_scopes: BTreeSet::from(["clinical:read".into()]),
+                allowed_destinations: BTreeSet::from([DestinationClass::LocalModelForge]),
+                allowed_authentication_strengths: BTreeSet::from(["urn:mfa".into()]),
             },
         )]
         .into_iter()
@@ -581,6 +629,71 @@ async fn kill_switch_denies_an_otherwise_authorized_operation() {
             .authorize(&subject(), &entry, Some(&medication_grant()))
             .await,
         Err(GatewayError::PolicyDenied)
+    );
+}
+
+#[tokio::test]
+async fn step_up_authentication_strength_is_enforced_when_configured() {
+    let policy =
+        PolicySet::new([step_up_tenant_policy()], policy_snapshot(), false).expect("valid policy");
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.medication_conflict_check")
+        .expect("catalog entry");
+
+    assert_eq!(
+        policy
+            .authorize(&subject(), &entry, Some(&medication_grant()))
+            .await,
+        Err(GatewayError::PolicyDenied),
+        "subject's authentication_strength is \"local-attested\", not the required \"urn:mfa\""
+    );
+
+    let mut stepped_up = subject();
+    stepped_up.authentication_strength = "urn:mfa".into();
+    assert!(
+        policy
+            .authorize(&stepped_up, &entry, Some(&medication_grant()))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn egress_none_operation_rejects_non_local_destination_even_when_tenant_policy_allows_it() {
+    let permissive_policy = TenantPolicy {
+        organization_id: "org-3".into(),
+        tools: [(
+            "clinical.medication_conflict_check".into(),
+            ToolEntitlement {
+                allowed_roles: BTreeSet::from(["clinician".into()]),
+                required_scopes: BTreeSet::from(["clinical:read".into()]),
+                allowed_destinations: BTreeSet::from([
+                    DestinationClass::LocalModelForge,
+                    DestinationClass::ApprovedThirdParty,
+                ]),
+                allowed_authentication_strengths: BTreeSet::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let policy =
+        PolicySet::new([permissive_policy], policy_snapshot(), false).expect("valid policy");
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.medication_conflict_check")
+        .expect("catalog entry");
+    assert_eq!(entry.egress, EgressClass::None);
+
+    let mut remote_grant = medication_grant();
+    remote_grant.destination = DestinationClass::ApprovedThirdParty;
+    assert_eq!(
+        policy
+            .authorize(&subject(), &entry, Some(&remote_grant))
+            .await,
+        Err(GatewayError::PolicyDenied),
+        "tenant policy allows the destination, but the catalog's egress: None must still block it"
     );
 }
 
