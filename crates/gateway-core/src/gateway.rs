@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::{ops::ControlFlow, sync::Arc};
 
 use uuid::Uuid;
 
 use crate::{
-    AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, DomainAdapter, GatewayError,
-    GrantResolver, OperationResponse, PayloadLimits, PolicyEngine, RiskClass, catalog_entry,
-    operation_digest,
+    AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, CatalogEntry, DomainAdapter,
+    GatewayError, GrantResolver, IdempotencyAdmission, IdempotencyScope, IdempotencyStore,
+    OperationResponse, PayloadLimits, PolicyEngine, PolicySnapshot, RiskClass, arguments_digest,
+    catalog_entry, operation_digest,
 };
 
 pub struct Gateway {
@@ -13,6 +14,7 @@ pub struct Gateway {
     grants: Arc<dyn GrantResolver>,
     domain: Arc<dyn DomainAdapter>,
     audit: Arc<dyn AuditSink>,
+    idempotency: Option<Arc<dyn IdempotencyStore>>,
     limits: PayloadLimits,
 }
 
@@ -29,6 +31,7 @@ impl Gateway {
             grants,
             domain,
             audit,
+            idempotency: None,
             limits: PayloadLimits::default(),
         }
     }
@@ -36,6 +39,16 @@ impl Gateway {
     #[must_use]
     pub fn with_limits(mut self, limits: PayloadLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Configures the idempotency store required by any catalog entry with
+    /// `idempotency_required: true`. Without one, such an entry fails closed with
+    /// [`GatewayError::IdempotencyStoreUnavailable`] rather than silently skipping replay
+    /// protection.
+    #[must_use]
+    pub fn with_idempotency_store(mut self, idempotency: Arc<dyn IdempotencyStore>) -> Self {
+        self.idempotency = Some(idempotency);
         self
     }
 
@@ -51,18 +64,7 @@ impl Gateway {
     ) -> Result<OperationResponse, GatewayError> {
         let operation_id = Uuid::new_v4();
         let Some(entry) = catalog_entry(&request.tool_name) else {
-            self.audit
-                .record(AuditEvent {
-                    operation_id,
-                    subject_id: request.subject.subject_id.clone(),
-                    client_id: request.subject.client_id.clone(),
-                    organization_id: request.subject.organization_id.clone(),
-                    tool_name: request.tool_name.clone(),
-                    risk: RiskClass::Prohibited,
-                    outcome: AuditOutcome::Denied,
-                    policy_version: None,
-                    error_class: Some(GatewayError::UnknownOperation.error_class().to_owned()),
-                })
+            self.record_unknown_operation(operation_id, &request)
                 .await?;
             return Err(GatewayError::UnknownOperation);
         };
@@ -101,6 +103,14 @@ impl Gateway {
         )
         .await?;
 
+        let idempotency = match self
+            .resolve_idempotency(operation_id, &request, &entry, &digest, &snapshot)
+            .await?
+        {
+            ControlFlow::Break(response) => return Ok(response),
+            ControlFlow::Continue(scope) => scope,
+        };
+
         let execution = self
             .domain
             .call(
@@ -117,6 +127,9 @@ impl Gateway {
         let result = match execution {
             Ok(result) => result,
             Err(error) => {
+                if let (Some(scope), Some(store)) = (&idempotency, &self.idempotency) {
+                    store.abort(scope).await?;
+                }
                 self.record_outcome(
                     operation_id,
                     &request,
@@ -129,6 +142,11 @@ impl Gateway {
                 return Err(error);
             }
         };
+
+        if let (Some(scope), Some(store)) = (&idempotency, &self.idempotency) {
+            let digest = arguments_digest(&entry.name, &request.arguments);
+            store.complete(scope, &digest, &result).await?;
+        }
 
         self.record_outcome(
             operation_id,
@@ -146,6 +164,91 @@ impl Gateway {
             policy_snapshot: snapshot,
             result,
         })
+    }
+
+    async fn record_unknown_operation(
+        &self,
+        operation_id: Uuid,
+        request: &AdmissionRequest,
+    ) -> Result<(), GatewayError> {
+        self.audit
+            .record(AuditEvent {
+                operation_id,
+                subject_id: request.subject.subject_id.clone(),
+                client_id: request.subject.client_id.clone(),
+                organization_id: request.subject.organization_id.clone(),
+                tool_name: request.tool_name.clone(),
+                risk: RiskClass::Prohibited,
+                outcome: AuditOutcome::Denied,
+                policy_version: None,
+                error_class: Some(GatewayError::UnknownOperation.error_class().to_owned()),
+            })
+            .await
+    }
+
+    /// Resolves the idempotency admission for `entry`, if it requires one. Returns
+    /// [`ControlFlow::Break`] with the response `execute` should return immediately (an exact
+    /// replay), or [`ControlFlow::Continue`] with the reserved scope (if any) `execute` must
+    /// later `complete` or `abort`.
+    async fn resolve_idempotency(
+        &self,
+        operation_id: Uuid,
+        request: &AdmissionRequest,
+        entry: &CatalogEntry,
+        digest: &str,
+        snapshot: &PolicySnapshot,
+    ) -> Result<ControlFlow<OperationResponse, Option<IdempotencyScope>>, GatewayError> {
+        if !entry.idempotency_required {
+            return Ok(ControlFlow::Continue(None));
+        }
+        match self.begin_idempotent(request, entry).await {
+            Ok(IdempotencyAdmission::Replay(result)) => {
+                self.record_outcome(
+                    operation_id,
+                    request,
+                    entry,
+                    AuditOutcome::Succeeded,
+                    Some(&snapshot.tool_policy_version),
+                    None,
+                )
+                .await?;
+                Ok(ControlFlow::Break(OperationResponse {
+                    operation_id,
+                    operation_digest: digest.to_owned(),
+                    policy_snapshot: snapshot.clone(),
+                    result,
+                }))
+            }
+            Ok(IdempotencyAdmission::Fresh) => Ok(ControlFlow::Continue(Some(idempotent_scope(
+                request, entry,
+            )?))),
+            Err(error) => {
+                self.record_outcome(
+                    operation_id,
+                    request,
+                    entry,
+                    AuditOutcome::Denied,
+                    Some(&snapshot.tool_policy_version),
+                    Some(error.error_class()),
+                )
+                .await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn begin_idempotent(
+        &self,
+        request: &AdmissionRequest,
+        entry: &CatalogEntry,
+    ) -> Result<IdempotencyAdmission, GatewayError> {
+        let store = self
+            .idempotency
+            .as_ref()
+            .ok_or(GatewayError::IdempotencyStoreUnavailable)?;
+        let scope = idempotent_scope(request, entry)?;
+        let digest = arguments_digest(&entry.name, &request.arguments);
+        store.begin(&scope, &digest).await
     }
 
     async fn admit(
@@ -204,6 +307,22 @@ impl Gateway {
             })
             .await
     }
+}
+
+fn idempotent_scope(
+    request: &AdmissionRequest,
+    entry: &CatalogEntry,
+) -> Result<IdempotencyScope, GatewayError> {
+    let idempotency_key = request
+        .idempotency_key
+        .clone()
+        .ok_or(GatewayError::IdempotencyKeyRequired)?;
+    Ok(IdempotencyScope {
+        organization_id: request.subject.organization_id.clone(),
+        subject_id: request.subject.subject_id.clone(),
+        tool_name: entry.name.clone(),
+        idempotency_key,
+    })
 }
 
 // The real catalog `Gateway::execute` looks entries up in never declares a `RiskClass::Prohibited`
@@ -286,6 +405,17 @@ mod tests {
         }
     }
 
+    fn idempotent_entry() -> CatalogEntry {
+        CatalogEntry {
+            name: "clinical_orders.record_review_decision".into(),
+            description: "hypothetical idempotent controlled write".into(),
+            risk: crate::RiskClass::ControlledWrite,
+            egress: EgressClass::None,
+            phi_fields: BTreeSet::new(),
+            idempotency_required: true,
+        }
+    }
+
     fn subject() -> SubjectContext {
         SubjectContext {
             subject_id: "clinician-7".into(),
@@ -320,5 +450,66 @@ mod tests {
             )
             .await;
         assert_eq!(error.err(), Some(GatewayError::PolicyDenied));
+    }
+
+    fn idempotent_request(idempotency_key: &str) -> AdmissionRequest {
+        AdmissionRequest {
+            subject: subject(),
+            tool_name: "clinical_orders.record_review_decision".into(),
+            arguments: json!({"decision": "approved"}),
+            context_grant_id: None,
+            approval_ticket: Some("ticket".into()),
+            idempotency_key: Some(idempotency_key.into()),
+            now_epoch_seconds: 1_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_idempotent_fails_closed_without_a_configured_store() {
+        let gateway = Gateway::new(
+            std::sync::Arc::new(UnreachablePolicy),
+            std::sync::Arc::new(UnreachableGrants),
+            std::sync::Arc::new(UnreachableDomain),
+            std::sync::Arc::new(NullAudit),
+        );
+        let error = gateway
+            .begin_idempotent(&idempotent_request("key-1"), &idempotent_entry())
+            .await;
+        assert_eq!(error.err(), Some(GatewayError::IdempotencyStoreUnavailable));
+    }
+
+    #[tokio::test]
+    async fn begin_idempotent_reserves_and_replays_through_the_configured_store() {
+        let gateway = Gateway::new(
+            std::sync::Arc::new(UnreachablePolicy),
+            std::sync::Arc::new(UnreachableGrants),
+            std::sync::Arc::new(UnreachableDomain),
+            std::sync::Arc::new(NullAudit),
+        )
+        .with_idempotency_store(std::sync::Arc::new(
+            crate::InMemoryIdempotencyStore::default(),
+        ));
+        let entry = idempotent_entry();
+
+        let first = gateway
+            .begin_idempotent(&idempotent_request("key-1"), &entry)
+            .await;
+        assert!(matches!(first, Ok(crate::IdempotencyAdmission::Fresh)));
+
+        let concurrent = gateway
+            .begin_idempotent(&idempotent_request("key-1"), &entry)
+            .await;
+        assert_eq!(
+            concurrent.err(),
+            Some(GatewayError::IdempotencyOperationInProgress)
+        );
+
+        let different_key = gateway
+            .begin_idempotent(&idempotent_request("key-2"), &entry)
+            .await;
+        assert!(matches!(
+            different_key,
+            Ok(crate::IdempotencyAdmission::Fresh)
+        ));
     }
 }

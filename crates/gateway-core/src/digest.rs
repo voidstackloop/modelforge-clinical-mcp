@@ -35,6 +35,23 @@ pub fn operation_digest(
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// A digest over just the tool name and normalized arguments, deliberately excluding subject,
+/// grant, and policy snapshot — unlike `operation_digest` (used for approval-ticket binding,
+/// which must be sensitive to policy changes). Idempotency-key reuse detection needs the
+/// opposite property: a legitimate retry of the exact same request should still be recognized
+/// as the same request even if the policy snapshot has since been refreshed, so long as the
+/// caller and normalized arguments are unchanged (the caller/tool/key are already the lookup
+/// key; this only needs to catch a *different* arguments payload reusing the same key).
+#[must_use]
+pub fn arguments_digest(tool_name: &str, arguments: &Value) -> String {
+    let canonical = canonicalize(arguments);
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(&canonical).unwrap_or_default());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 fn canonicalize(value: &Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),

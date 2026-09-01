@@ -20,6 +20,12 @@ pub enum GatewayError {
     ApprovalRequired,
     #[error("idempotency key is required")]
     IdempotencyKeyRequired,
+    #[error("idempotency key was reused with different arguments")]
+    IdempotencyKeyReused,
+    #[error("another request is already in progress for this idempotency key")]
+    IdempotencyOperationInProgress,
+    #[error("idempotency store is unavailable")]
+    IdempotencyStoreUnavailable,
     #[error("payload violates gateway limits: {0}")]
     PayloadRejected(&'static str),
     #[error("authorization dependency is unavailable")]
@@ -43,6 +49,9 @@ impl GatewayError {
             Self::GrantScopeInsufficient => "grant_scope_insufficient",
             Self::ApprovalRequired => "approval_required",
             Self::IdempotencyKeyRequired => "idempotency_key_required",
+            Self::IdempotencyKeyReused => "idempotency_key_reused",
+            Self::IdempotencyOperationInProgress => "idempotency_operation_in_progress",
+            Self::IdempotencyStoreUnavailable => "idempotency_store_unavailable",
             Self::PayloadRejected(_) => "payload_rejected",
             Self::AuthorizationUnavailable => "authorization_unavailable",
             Self::DomainUnavailable => "domain_unavailable",

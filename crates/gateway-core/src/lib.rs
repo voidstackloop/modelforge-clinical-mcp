@@ -7,6 +7,7 @@ mod digest;
 mod error;
 mod gateway;
 mod grants;
+mod idempotency;
 mod limits;
 mod medication;
 mod medication_safety;
@@ -23,10 +24,11 @@ pub use contracts::{
     AdmissionRequest, AuditEvent, AuditOutcome, CatalogEntry, ContextGrant, DestinationClass,
     EgressClass, OperationResponse, PolicySnapshot, RiskClass, SubjectContext,
 };
-pub use digest::operation_digest;
+pub use digest::{arguments_digest, operation_digest};
 pub use error::GatewayError;
 pub use gateway::Gateway;
 pub use grants::{GrantSnapshot, GrantSnapshotError};
+pub use idempotency::InMemoryIdempotencyStore;
 pub use limits::PayloadLimits;
 pub use medication::{
     ClinicalDomainAdapter, MedicationCheckStatus, MedicationConflictArguments,
@@ -35,7 +37,10 @@ pub use medication::{
 };
 pub use medication_safety::BuiltInMedicationConflictService;
 pub use policy::{PolicySet, PolicySetError, TenantPolicy, ToolEntitlement};
-pub use ports::{AuditSink, DomainAdapter, GrantResolver, PolicyEngine};
+pub use ports::{
+    AuditSink, DomainAdapter, GrantResolver, IdempotencyAdmission, IdempotencyScope,
+    IdempotencyStore, PolicyEngine,
+};
 pub use prompts::{ClinicalPromptTemplate, clinical_response_contract_prompt};
 pub use response_contract::{
     RESPONSE_CONTRACT_SECTION_HEADINGS, ResponseContractCheckArguments,

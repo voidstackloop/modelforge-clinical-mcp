@@ -530,12 +530,15 @@ fn protocol_error(error: &GatewayError) -> ErrorData {
         | GatewayError::GrantScopeInsufficient
         | GatewayError::ApprovalRequired
         | GatewayError::IdempotencyKeyRequired
+        | GatewayError::IdempotencyKeyReused
+        | GatewayError::IdempotencyOperationInProgress
         | GatewayError::UnknownOperation => {
             ErrorData::invalid_request("clinical operation was denied", data)
         }
         GatewayError::AuthorizationUnavailable
         | GatewayError::DomainUnavailable
-        | GatewayError::AuditUnavailable => {
+        | GatewayError::AuditUnavailable
+        | GatewayError::IdempotencyStoreUnavailable => {
             ErrorData::internal_error("clinical dependency is unavailable", data)
         }
     }

@@ -13,12 +13,14 @@ use modelforge_clinical_mcp_core::{
     AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, BuiltInMedicationConflictService,
     CatalogEntry, ClinicalDomainAdapter, ClinicalPromptTemplate, ContextGrant, DestinationClass,
     DomainAdapter, DomainRouter, EgressClass, FileAuditSink, Gateway, GatewayError, GrantResolver,
-    GrantSnapshot, MedicationCheckStatus, MedicationConflictRequest, MedicationConflictResult,
-    MedicationConflictService, MedicationConflictWarning, MedicationConflictWarningKind,
-    PolicyEngine, PolicySet, PolicySnapshot, RiskClass, RuntimeBackendDiagnostics,
-    RuntimeDiagnosticsResult, RuntimeDiagnosticsService, RuntimeDomainAdapter,
-    RuntimeLifecycleState, SubjectContext, TenantPolicy, ToolEntitlement, catalog,
-    check_response_contract_compliance, clinical_response_contract_prompt, operation_digest,
+    GrantSnapshot, IdempotencyAdmission, IdempotencyScope, IdempotencyStore,
+    InMemoryIdempotencyStore, MedicationCheckStatus, MedicationConflictRequest,
+    MedicationConflictResult, MedicationConflictService, MedicationConflictWarning,
+    MedicationConflictWarningKind, PolicyEngine, PolicySet, PolicySnapshot, RiskClass,
+    RuntimeBackendDiagnostics, RuntimeDiagnosticsResult, RuntimeDiagnosticsService,
+    RuntimeDomainAdapter, RuntimeLifecycleState, SubjectContext, TenantPolicy, ToolEntitlement,
+    catalog, check_response_contract_compliance, clinical_response_contract_prompt,
+    operation_digest,
 };
 use serde_json::{Value, json};
 
@@ -379,6 +381,79 @@ fn prompt_templates_append_mode_instruction_after_the_response_contract() {
 
     let compute_triage = ClinicalPromptTemplate::ComputeIncidentTriage.render();
     assert!(compute_triage.contains("bounded runtime diagnostics"));
+}
+
+fn idempotency_scope() -> IdempotencyScope {
+    IdempotencyScope {
+        organization_id: "org-3".into(),
+        subject_id: "clinician-7".into(),
+        tool_name: "clinical.medication_conflict_check".into(),
+        idempotency_key: "key-1".into(),
+    }
+}
+
+#[tokio::test]
+async fn idempotency_store_replays_the_stored_result_for_a_matching_digest() {
+    let store = InMemoryIdempotencyStore::default();
+    let scope = idempotency_scope();
+    assert!(matches!(
+        store.begin(&scope, "digest-a").await,
+        Ok(IdempotencyAdmission::Fresh)
+    ));
+    store
+        .complete(&scope, "digest-a", &json!({"ok": true}))
+        .await
+        .expect("complete");
+
+    let replay = store.begin(&scope, "digest-a").await;
+    assert!(matches!(
+        replay,
+        Ok(IdempotencyAdmission::Replay(ref value)) if *value == json!({"ok": true})
+    ));
+}
+
+#[tokio::test]
+async fn idempotency_store_rejects_a_reused_key_with_different_arguments() {
+    let store = InMemoryIdempotencyStore::default();
+    let scope = idempotency_scope();
+    store.begin(&scope, "digest-a").await.expect("first begin");
+    store
+        .complete(&scope, "digest-a", &json!({"ok": true}))
+        .await
+        .expect("complete");
+
+    let reused = store.begin(&scope, "digest-b").await;
+    assert_eq!(reused.err(), Some(GatewayError::IdempotencyKeyReused));
+}
+
+#[tokio::test]
+async fn idempotency_store_rejects_a_concurrent_in_flight_duplicate() {
+    let store = InMemoryIdempotencyStore::default();
+    let scope = idempotency_scope();
+    assert!(matches!(
+        store.begin(&scope, "digest-a").await,
+        Ok(IdempotencyAdmission::Fresh)
+    ));
+
+    let concurrent = store.begin(&scope, "digest-a").await;
+    assert_eq!(
+        concurrent.err(),
+        Some(GatewayError::IdempotencyOperationInProgress),
+        "a second caller must not also observe Fresh while the first is still in flight"
+    );
+}
+
+#[tokio::test]
+async fn idempotency_store_abort_frees_the_scope_for_a_fresh_retry() {
+    let store = InMemoryIdempotencyStore::default();
+    let scope = idempotency_scope();
+    store.begin(&scope, "digest-a").await.expect("first begin");
+    store.abort(&scope).await.expect("abort");
+
+    assert!(matches!(
+        store.begin(&scope, "digest-a").await,
+        Ok(IdempotencyAdmission::Fresh)
+    ));
 }
 
 #[tokio::test]
