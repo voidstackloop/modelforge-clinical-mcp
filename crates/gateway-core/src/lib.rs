@@ -8,6 +8,7 @@ mod gateway;
 mod grants;
 mod limits;
 mod medication;
+mod medication_safety;
 mod policy;
 mod ports;
 mod prompts;
@@ -26,9 +27,11 @@ pub use gateway::Gateway;
 pub use grants::{GrantSnapshot, GrantSnapshotError};
 pub use limits::PayloadLimits;
 pub use medication::{
-    ClinicalDomainAdapter, MedicationConflictArguments, MedicationConflictFinding,
+    ClinicalDomainAdapter, MedicationCheckStatus, MedicationConflictArguments,
     MedicationConflictRequest, MedicationConflictResult, MedicationConflictService,
+    MedicationConflictWarning, MedicationConflictWarningKind,
 };
+pub use medication_safety::BuiltInMedicationConflictService;
 pub use policy::{PolicySet, PolicySetError, TenantPolicy, ToolEntitlement};
 pub use ports::{AuditSink, DomainAdapter, GrantResolver, PolicyEngine};
 pub use prompts::{ClinicalPromptTemplate, clinical_response_contract_prompt};

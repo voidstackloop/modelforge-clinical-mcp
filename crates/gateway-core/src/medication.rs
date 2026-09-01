@@ -29,19 +29,58 @@ pub struct MedicationConflictRequest {
     pub allergies: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MedicationConflictFinding {
-    pub severity: String,
-    pub summary: String,
-    pub evidence_code: String,
+/// Mirrors `MedicationConflictWarning["kind"]` in `app/src/medical-safety.ts` in the main
+/// `ModelForge` app. `DuplicateClass` is part of that type's contract for a future provider but
+/// is never produced by the built-in seed-list provider, same as upstream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum MedicationConflictWarningKind {
+    Allergy,
+    DuplicateClass,
+    KnownInteraction,
 }
 
+/// Mirrors `MedicationConflictWarning` in `medical-safety.ts`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MedicationConflictWarning {
+    pub kind: MedicationConflictWarningKind,
+    pub medication: String,
+    pub conflicts_with: String,
+    pub detail: String,
+}
+
+/// Mirrors `MedicationSafetyResult["status"]` in `medical-safety.ts`: the provider's own
+/// coverage claim when a check actually ran, or why it didn't.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum MedicationCheckStatus {
+    Demonstration,
+    ClinicallyAuthoritative,
+    Unavailable,
+    Failed,
+}
+
+/// Mirrors `MedicationSafetyResult` in `medical-safety.ts`. `evaluated_at_epoch_seconds`
+/// replaces the upstream ISO-8601 `evaluatedAt` string — this gateway already threads epoch
+/// seconds through every other timestamp and has no other reason to depend on a datetime crate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MedicationConflictResult {
-    pub findings: Vec<MedicationConflictFinding>,
-    pub limitations: Vec<String>,
+    pub provider_name: String,
+    pub provider_label: String,
+    pub status: MedicationCheckStatus,
+    pub evaluated_at_epoch_seconds: u64,
+    /// False when no allergies or medications were supplied at all — distinct from `true` with
+    /// zero warnings, which means the check ran and found nothing.
+    pub applicable: bool,
+    pub warnings: Vec<MedicationConflictWarning>,
+    pub limitations: String,
+    /// Present only when `status` is `Failed` — a fixed, safe-to-display message, never the
+    /// provider's raw error (which could otherwise echo back the medication/allergy text it was
+    /// just given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[async_trait]

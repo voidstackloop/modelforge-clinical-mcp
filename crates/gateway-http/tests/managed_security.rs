@@ -22,9 +22,9 @@ use jsonwebtoken::{
 };
 use modelforge_clinical_mcp_core::{
     AuditEvent, AuditSink, ClinicalDomainAdapter, ContextGrant, DestinationClass, DomainAdapter,
-    DomainRouter, Gateway, GatewayError, GrantSnapshot, MedicationConflictRequest,
-    MedicationConflictResult, MedicationConflictService, PolicySet, PolicySnapshot,
-    RuntimeBackendDiagnostics, RuntimeDiagnosticsResult, RuntimeDiagnosticsService,
+    DomainRouter, Gateway, GatewayError, GrantSnapshot, MedicationCheckStatus,
+    MedicationConflictRequest, MedicationConflictResult, MedicationConflictService, PolicySet,
+    PolicySnapshot, RuntimeBackendDiagnostics, RuntimeDiagnosticsResult, RuntimeDiagnosticsService,
     RuntimeDomainAdapter, RuntimeLifecycleState, TenantPolicy, ToolEntitlement,
 };
 use modelforge_clinical_mcp_http::{
@@ -428,8 +428,14 @@ impl MedicationConflictService for TestMedicationService {
     ) -> Result<MedicationConflictResult, GatewayError> {
         *self.0.lock().map_err(|_| GatewayError::DomainUnavailable)? = Some(request);
         Ok(MedicationConflictResult {
-            findings: Vec::new(),
-            limitations: vec!["Decision support only".into()],
+            provider_name: "test-provider".into(),
+            provider_label: "Test provider".into(),
+            status: MedicationCheckStatus::Demonstration,
+            evaluated_at_epoch_seconds: 1_000,
+            applicable: true,
+            warnings: Vec::new(),
+            limitations: "Decision support only".into(),
+            error: None,
         })
     }
 }

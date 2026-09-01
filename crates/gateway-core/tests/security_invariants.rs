@@ -10,11 +10,12 @@ use std::{
 
 use async_trait::async_trait;
 use modelforge_clinical_mcp_core::{
-    AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, CatalogEntry, ClinicalDomainAdapter,
-    ClinicalPromptTemplate, ContextGrant, DestinationClass, DomainAdapter, DomainRouter,
-    EgressClass, Gateway, GatewayError, GrantResolver, GrantSnapshot, MedicationConflictFinding,
-    MedicationConflictRequest, MedicationConflictResult, MedicationConflictService, PolicyEngine,
-    PolicySet, PolicySnapshot, RuntimeBackendDiagnostics, RuntimeDiagnosticsResult,
+    AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, BuiltInMedicationConflictService,
+    CatalogEntry, ClinicalDomainAdapter, ClinicalPromptTemplate, ContextGrant, DestinationClass,
+    DomainAdapter, DomainRouter, EgressClass, Gateway, GatewayError, GrantResolver, GrantSnapshot,
+    MedicationCheckStatus, MedicationConflictRequest, MedicationConflictResult,
+    MedicationConflictService, MedicationConflictWarning, MedicationConflictWarningKind,
+    PolicyEngine, PolicySet, PolicySnapshot, RuntimeBackendDiagnostics, RuntimeDiagnosticsResult,
     RuntimeDiagnosticsService, RuntimeDomainAdapter, RuntimeLifecycleState, SubjectContext,
     TenantPolicy, ToolEntitlement, catalog, check_response_contract_compliance,
     clinical_response_contract_prompt, operation_digest,
@@ -380,6 +381,91 @@ fn prompt_templates_append_mode_instruction_after_the_response_contract() {
     assert!(compute_triage.contains("bounded runtime diagnostics"));
 }
 
+fn medication_request(allergies: &[&str], medications: &[&str]) -> MedicationConflictRequest {
+    MedicationConflictRequest {
+        organization_id: "org-3".into(),
+        case_id: "case-9".into(),
+        allergies: allergies.iter().map(|value| (*value).to_owned()).collect(),
+        medications: medications
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn built_in_medication_service_flags_an_allergy_class_synonym() {
+    let result = BuiltInMedicationConflictService
+        .check(medication_request(&["Penicillin"], &["Amoxicillin 500mg"]))
+        .await
+        .expect("check result");
+    assert!(result.applicable);
+    assert_eq!(result.status, MedicationCheckStatus::Demonstration);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == MedicationConflictWarningKind::Allergy)
+    );
+}
+
+#[tokio::test]
+async fn built_in_medication_service_flags_a_known_interaction_pair() {
+    let result = BuiltInMedicationConflictService
+        .check(medication_request(&[], &["Warfarin", "Ibuprofen"]))
+        .await
+        .expect("check result");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == MedicationConflictWarningKind::KnownInteraction)
+    );
+}
+
+#[tokio::test]
+async fn built_in_medication_service_finds_nothing_for_unrelated_terms() {
+    let result = BuiltInMedicationConflictService
+        .check(medication_request(&["Latex"], &["Metoprolol"]))
+        .await
+        .expect("check result");
+    assert!(result.applicable);
+    assert!(result.warnings.is_empty());
+}
+
+#[tokio::test]
+async fn built_in_medication_service_is_not_applicable_when_nothing_is_recorded() {
+    let empty = BuiltInMedicationConflictService
+        .check(medication_request(&[], &[]))
+        .await
+        .expect("check result");
+    assert!(!empty.applicable);
+    assert!(empty.warnings.is_empty());
+
+    let whitespace_only = BuiltInMedicationConflictService
+        .check(medication_request(&["  ", ""], &["   "]))
+        .await
+        .expect("check result");
+    assert!(!whitespace_only.applicable);
+}
+
+#[tokio::test]
+async fn built_in_medication_service_matching_is_case_and_whitespace_insensitive() {
+    let padded = BuiltInMedicationConflictService
+        .check(medication_request(
+            &[" Penicillin "],
+            &["AMOXICILLIN 500mg"],
+        ))
+        .await
+        .expect("check result");
+    let lowercase = BuiltInMedicationConflictService
+        .check(medication_request(&["penicillin"], &["amoxicillin 500mg"]))
+        .await
+        .expect("check result");
+    assert_eq!(padded.warnings.len(), lowercase.warnings.len());
+    assert!(!padded.warnings.is_empty());
+}
+
 #[test]
 fn catalog_is_sorted_and_unique() {
     let names = catalog()
@@ -717,12 +803,19 @@ impl MedicationConflictService for CapturingMedicationService {
     ) -> Result<MedicationConflictResult, GatewayError> {
         *self.0.lock().map_err(|_| GatewayError::DomainUnavailable)? = Some(request);
         Ok(MedicationConflictResult {
-            findings: vec![MedicationConflictFinding {
-                severity: "high".into(),
-                summary: "review required".into(),
-                evidence_code: "MF-DRUG-1".into(),
+            provider_name: "test-provider".into(),
+            provider_label: "Test provider".into(),
+            status: MedicationCheckStatus::Demonstration,
+            evaluated_at_epoch_seconds: 1_000,
+            applicable: true,
+            warnings: vec![MedicationConflictWarning {
+                kind: MedicationConflictWarningKind::KnownInteraction,
+                medication: "amoxicillin".into(),
+                conflicts_with: "penicillin".into(),
+                detail: "review required".into(),
             }],
-            limitations: vec!["Decision support only".into()],
+            limitations: "Decision support only".into(),
+            error: None,
         })
     }
 }
