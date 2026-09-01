@@ -12,8 +12,10 @@ use async_trait::async_trait;
 use modelforge_clinical_mcp_core::{
     AdmissionRequest, ApprovalBinding, ApprovalVerifier, AuditEvent, AuditOutcome, AuditSink,
     BuiltInMedicationConflictService, CatalogEntry, ClinicalDomainAdapter, ClinicalPromptTemplate,
-    ContextGrant, DestinationClass, DomainAdapter, DomainRouter, EgressClass, FileAuditSink,
-    Gateway, GatewayError, GrantResolver, GrantSnapshot, HmacApprovalVerifier,
+    ComputeDomainAdapter, ComputePriority, ComputeRuntime, ComputeSchedulingStatus,
+    ComputeSubmitRequest, ComputeSubmitResult, ComputeSubmitService, ContextGrant,
+    DestinationClass, DomainAdapter, DomainRouter, EgressClass, FileAuditSink, Gateway,
+    GatewayError, GrantResolver, GrantSnapshot, HmacApprovalVerifier, HttpComputeSubmitService,
     HttpReviewDecisionService, IdempotencyAdmission, IdempotencyScope, IdempotencyStore,
     IdempotentCompletion, InMemoryIdempotencyStore, MedicationCheckStatus,
     MedicationConflictRequest, MedicationConflictResult, MedicationConflictService,
@@ -1450,4 +1452,270 @@ async fn record_review_decision_requires_approval_and_deduplicates_via_idempoten
     let serialized = serde_json::to_string(&*events).unwrap_or_default();
     assert!(!serialized.contains("Dosage confirmed"));
     assert!(!serialized.contains("renal function"));
+}
+
+#[test]
+fn http_compute_submit_service_rejects_a_non_https_base_url() {
+    assert!(HttpComputeSubmitService::new("http://compute.test").is_err());
+}
+
+#[derive(Default)]
+struct CapturingComputeService(Mutex<Vec<ComputeSubmitRequest>>);
+
+#[async_trait]
+impl ComputeSubmitService for CapturingComputeService {
+    async fn submit(
+        &self,
+        request: ComputeSubmitRequest,
+    ) -> Result<ComputeSubmitResult, GatewayError> {
+        let result = ComputeSubmitResult {
+            request_id: "request-1".into(),
+            pool_id: request.pool_id.clone(),
+            status: ComputeSchedulingStatus::Queued,
+            reasons: vec!["awaiting capacity".into()],
+            lease_id: None,
+        };
+        self.0
+            .lock()
+            .map_err(|_| GatewayError::DomainUnavailable)?
+            .push(request);
+        Ok(result)
+    }
+}
+
+fn compute_submit_arguments() -> Value {
+    json!({
+        "poolId": "pool-1",
+        "workloadKind": "medication-review-inference",
+        "priority": "interactive",
+        "requirements": {
+            "cpuThreads": 4,
+            "ramMB": 8_192,
+            "runtime": "llamacpp",
+        },
+    })
+}
+
+#[tokio::test]
+async fn compute_domain_adapter_binds_organization_and_subject_from_trusted_context() {
+    let service = Arc::new(CapturingComputeService::default());
+    let adapter = ComputeDomainAdapter::new(service.clone());
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.submit_compute_request")
+        .expect("catalog entry");
+    assert_eq!(entry.risk, RiskClass::ControlledWrite);
+    assert!(entry.idempotency_required);
+    assert!(!entry.requires_context_grant());
+
+    adapter
+        .call(&subject(), &entry, None, compute_submit_arguments())
+        .await
+        .expect("adapter result");
+    let captured = service
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.organization_id, "org-3");
+    assert_eq!(request.submitted_by_subject_id, "clinician-7");
+    assert_eq!(request.pool_id, "pool-1");
+    assert_eq!(request.priority, ComputePriority::Interactive);
+    assert_eq!(request.requirements.runtime, ComputeRuntime::Llamacpp);
+}
+
+#[tokio::test]
+async fn compute_domain_adapter_rejects_requirements_that_violate_cross_field_invariants() {
+    let adapter = ComputeDomainAdapter::new(Arc::new(CapturingComputeService::default()));
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.submit_compute_request")
+        .expect("catalog entry");
+
+    let mut zero_cpu = compute_submit_arguments();
+    zero_cpu["requirements"]["cpuThreads"] = json!(0);
+    let result = adapter.call(&subject(), &entry, None, zero_cpu).await;
+    assert!(matches!(result, Err(GatewayError::PayloadRejected(_))));
+
+    let mut mismatched_device_ids = compute_submit_arguments();
+    mismatched_device_ids["requirements"]["acceleratorCount"] = json!(1);
+    mismatched_device_ids["requirements"]["acceleratorDeviceIds"] = json!(["gpu-1", "gpu-2"]);
+    let result = adapter
+        .call(&subject(), &entry, None, mismatched_device_ids)
+        .await;
+    assert!(matches!(result, Err(GatewayError::PayloadRejected(_))));
+
+    let mut vram_without_accelerator = compute_submit_arguments();
+    vram_without_accelerator["requirements"]["vramMBPerDevice"] = json!(8_000);
+    let result = adapter
+        .call(&subject(), &entry, None, vram_without_accelerator)
+        .await;
+    assert!(matches!(result, Err(GatewayError::PayloadRejected(_))));
+}
+
+#[tokio::test]
+async fn unconfigured_compute_submit_service_fails_closed_instead_of_fabricating_a_placement() {
+    let adapter = ComputeDomainAdapter::new(Arc::new(
+        modelforge_clinical_mcp_core::UnconfiguredComputeSubmitService,
+    ));
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.submit_compute_request")
+        .expect("catalog entry");
+    let result = adapter
+        .call(&subject(), &entry, None, compute_submit_arguments())
+        .await;
+    assert_eq!(result.err(), Some(GatewayError::DomainUnavailable));
+}
+
+fn compute_tenant_policy() -> TenantPolicy {
+    TenantPolicy {
+        organization_id: "org-3".into(),
+        tools: [(
+            "clinical.submit_compute_request".into(),
+            ToolEntitlement {
+                allowed_roles: BTreeSet::from(["clinician".into()]),
+                required_scopes: BTreeSet::from(["clinical:read".into()]),
+                allowed_destinations: BTreeSet::from([DestinationClass::LocalModelForge]),
+                allowed_authentication_strengths: BTreeSet::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+/// End to end through the public `Gateway::execute()` API, mirroring
+/// `record_review_decision_requires_approval_and_deduplicates_via_idempotency_key`: the second
+/// real catalog entry that is both `RiskClass::ControlledWrite` and
+/// `idempotency_required: true`, but (unlike the review-decision tool) one that needs no
+/// context grant at all, since a compute job carries no PHI.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a single connected scenario (no ticket, success, replay, reused key) sharing one gateway and one prior successful call; splitting it would duplicate that setup in each piece rather than shrink the test"
+)]
+#[tokio::test]
+async fn submit_compute_request_requires_approval_and_deduplicates_via_idempotency_key() {
+    let policy =
+        PolicySet::new([compute_tenant_policy()], policy_snapshot(), false).expect("valid policy");
+    let approval = Arc::new(HmacApprovalVerifier::new(
+        b"test-secret-thats-well-over-32-bytes-long",
+    ));
+    let service = Arc::new(CapturingComputeService::default());
+    let audit = Arc::new(MemoryAudit::default());
+    let gateway = Gateway::new(
+        Arc::new(policy),
+        Arc::new(StaticGrant(medication_grant())),
+        Arc::new(ComputeDomainAdapter::new(service.clone())),
+        audit.clone(),
+    )
+    .with_idempotency_store(Arc::new(InMemoryIdempotencyStore::default()))
+    .with_approval_verifier(approval.clone());
+
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.submit_compute_request")
+        .expect("catalog entry");
+    let arguments = compute_submit_arguments();
+
+    // Missing approval ticket is rejected before the domain adapter is ever called.
+    let no_ticket = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: arguments.clone(),
+            context_grant_id: None,
+            approval_ticket: None,
+            idempotency_key: Some("compute-key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await;
+    assert_eq!(no_ticket.err(), Some(GatewayError::ApprovalRequired));
+    assert!(
+        service
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "domain adapter must not run without a valid approval ticket"
+    );
+
+    // No context grant is resolved for this tool (it has no `phi_fields`), so the digest binds
+    // to `grant: None` unlike the review-decision test.
+    let snapshot = policy_snapshot();
+    let digest = operation_digest(&entry.name, &arguments, &subject(), None, &snapshot);
+    let ticket = approval
+        .issue(
+            &ApprovalBinding {
+                subject_id: "clinician-7",
+                client_id: "desktop-2",
+                tool_name: &entry.name,
+                operation_digest: &digest,
+            },
+            5_000,
+        )
+        .expect("issue ticket");
+    let first = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: arguments.clone(),
+            context_grant_id: None,
+            approval_ticket: Some(ticket.clone()),
+            idempotency_key: Some("compute-key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await
+        .expect("first execution succeeds");
+    assert_eq!(first.result["status"], "queued");
+    assert_eq!(
+        service
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1
+    );
+
+    // The same ticket cannot be replayed (single-use), but the idempotency store already has a
+    // terminal result for this scope/digest, so the retry is served as a replay and never
+    // reaches verify_approval or the domain adapter again.
+    let retry = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: arguments.clone(),
+            context_grant_id: None,
+            approval_ticket: None,
+            idempotency_key: Some("compute-key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await
+        .expect("retry replays the stored result");
+    assert_eq!(retry.result, first.result);
+    assert_eq!(
+        service
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1,
+        "a replayed retry must not re-invoke the domain adapter"
+    );
+
+    // A reused idempotency key with different arguments is rejected outright.
+    let mut different_arguments = compute_submit_arguments();
+    different_arguments["workloadKind"] = json!("a-different-workload");
+    let reused_key = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: different_arguments,
+            context_grant_id: None,
+            approval_ticket: None,
+            idempotency_key: Some("compute-key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await;
+    assert_eq!(reused_key.err(), Some(GatewayError::IdempotencyKeyReused));
 }

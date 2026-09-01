@@ -57,11 +57,17 @@ The initial M1 slice contains:
   recording a clinician's decision on a prior AI-assisted operation, gated by a single-use
   approval ticket and deduplicated by an idempotency key so a retry replays the original result
   instead of recording a second decision;
+- `clinical.submit_compute_request`, the design doc's second named controlled write: a typed,
+  organization-bound forward to ModelForge's own compute-control-plane scheduler
+  (`packages/contracts/src/compute.ts`, `server/src/compute/control-plane.ts` in the main app),
+  never a local reimplementation of bin-packing or node scheduling. Carries no PHI and needs no
+  context grant — a compute job is organization-scoped infrastructure, not case data — but is
+  still `RiskClass::ControlledWrite` and idempotency-required like the review-decision tool;
 - tests for catalog determinism, grant binding, tenant isolation, kill switches, digest stability,
   payload limits, trusted-context injection, domain routing, prompt rendering, resource reads,
-  idempotency reservation races, approval-ticket binding/expiry/replay, and audit privacy, plus an
-  end-to-end scenario test covering `clinical.record_review_decision`'s approval-then-idempotent-
-  replay path through the real catalog entry.
+  idempotency reservation races, approval-ticket binding/expiry/replay, and audit privacy, plus
+  end-to-end scenario tests covering both controlled-write tools' approval-then-idempotent-replay
+  path through their real catalog entries.
 
 ## Build
 
@@ -149,26 +155,29 @@ validated the same way `PolicySet::new` validates it in tests:
 
 `MODELFORGE_MCP_GRANT_SERVICE_URL` must be an `https://` origin; grants are looked up as
 `GET {url}/{grantId}` rather than stored by this repository. `MODELFORGE_MCP_APPROVAL_SECRET` signs
-and verifies approval tickets for `clinical.record_review_decision`, the catalog's first
-`RiskClass::ControlledWrite` tool (see below).
-`runtime.diagnostics` stays reachable but always returns `domain_unavailable`: no IPC bridge to a
-running desktop process exists in this repository, and fabricating numbers would be worse than
-failing closed.
+and verifies approval tickets for both `RiskClass::ControlledWrite` tools in the catalog (see
+below). `runtime.diagnostics` stays reachable but always returns `domain_unavailable`: no IPC
+bridge to a running desktop process exists in this repository, and fabricating numbers would be
+worse than failing closed.
 
-An independently-optional fifth variable enables `clinical.record_review_decision`, which records a
-clinician's accept/override/reject decision on a prior AI-assisted operation:
+Two more variables are each independently optional — set either, both, or neither, unrelated to
+the four above and to each other:
 
 ```bash
 export MODELFORGE_MCP_REVIEW_SERVICE_URL=https://reviews.example.com
+export MODELFORGE_MCP_COMPUTE_SERVICE_URL=https://compute.example.com
 ```
 
-Every call must carry a single-use `approvalTicket` — signed with `MODELFORGE_MCP_APPROVAL_SECRET`
-and bound to the exact operation, subject, client, grant, policy version, and expiry — and an
-`idempotencyKey` scoped to organization, subject, tool, and normalized arguments; a retry with the
-same key and arguments replays the stored terminal result instead of recording a second decision.
-Left unset, the tool stays listed and reachable but fails closed with `domain_unavailable` — the
-same "reachable but honest" pattern as `runtime.diagnostics` — rather than silently discarding a
-clinician's review decision.
+`MODELFORGE_MCP_REVIEW_SERVICE_URL` enables `clinical.record_review_decision`, which records a
+clinician's accept/override/reject decision on a prior AI-assisted operation.
+`MODELFORGE_MCP_COMPUTE_SERVICE_URL` enables `clinical.submit_compute_request`, which forwards a
+compute job to ModelForge's compute-control-plane scheduler. Every call to either tool must carry
+a single-use `approvalTicket` — signed with `MODELFORGE_MCP_APPROVAL_SECRET` and bound to the
+exact operation, subject, client, policy version, and expiry — and an `idempotencyKey` scoped to
+organization, subject, tool, and normalized arguments; a retry with the same key and arguments
+replays the stored terminal result instead of re-executing. Left unset, either tool stays listed
+and reachable but fails closed with `domain_unavailable` — the same "reachable but honest" pattern
+as `runtime.diagnostics` — rather than silently discarding a decision or fabricating a placement.
 
 **Known gap:** the managed HTTP adapter derives `SubjectContext` from a verified OIDC access
 token, so the chain above is complete for it. The stdio companion has no equivalent identity

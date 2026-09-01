@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::{CatalogEntry, EgressClass, RiskClass};
 
-pub const CATALOG_VERSION: &str = "2026-09-01.v2";
+pub const CATALOG_VERSION: &str = "2026-09-01.v3";
 
 #[must_use]
 pub fn catalog() -> Vec<CatalogEntry> {
@@ -33,6 +33,12 @@ pub fn catalog() -> Vec<CatalogEntry> {
             "Return bounded, non-secret ModelForge runtime diagnostics.",
             &[],
         ),
+        entry(
+            "clinical.submit_compute_request",
+            "Submit a compute request to ModelForge's compute-control-plane scheduler.",
+            &[],
+        )
+        .into_controlled_write(),
     ];
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries

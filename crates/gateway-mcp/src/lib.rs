@@ -5,9 +5,10 @@ use std::{
 
 use http::request::Parts;
 use modelforge_clinical_mcp_core::{
-    AdmissionRequest, CATALOG_VERSION, ClinicalPromptTemplate, Gateway, GatewayError,
-    MedicationConflictArguments, OperationResponse, ResponseContractCheckArguments,
-    ReviewDecisionArguments, ReviewDecisionOutcome, SubjectContext, catalog,
+    AdmissionRequest, CATALOG_VERSION, ClinicalPromptTemplate, ComputePriority,
+    ComputeSubmitArguments, Gateway, GatewayError, MedicationConflictArguments, OperationResponse,
+    ResourceProfile, ResourceRequirements, ResponseContractCheckArguments, ReviewDecisionArguments,
+    ReviewDecisionOutcome, SubjectContext, catalog,
 };
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
@@ -252,10 +253,11 @@ impl ClinicalServer {
     }
 }
 
-const CLINICAL_ENABLED_TOOLS: [&str; 5] = [
+const CLINICAL_ENABLED_TOOLS: [&str; 6] = [
     "clinical.medication_conflict_check",
     "clinical.record_review_decision",
     "clinical.response_contract_check",
+    "clinical.submit_compute_request",
     "modelforge.capabilities",
     "runtime.diagnostics",
 ];
@@ -288,6 +290,33 @@ struct RecordReviewDecisionInput {
     reviewed_operation_id: uuid::Uuid,
     decision: ReviewDecisionOutcome,
     rationale: String,
+}
+
+fn default_resource_profile() -> ResourceProfile {
+    ResourceProfile::Balanced
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubmitComputeRequestInput {
+    /// Single-use ticket from `ModelForge`'s trusted UI, bound to this exact operation.
+    approval_ticket: String,
+    /// Caller-generated key scoped to organization, subject, tool, and normalized arguments —
+    /// a retry with the same key and arguments replays the original result instead of
+    /// submitting a second compute job.
+    idempotency_key: String,
+    pool_id: String,
+    workload_kind: String,
+    priority: ComputePriority,
+    #[serde(default = "default_resource_profile")]
+    profile: ResourceProfile,
+    requirements: ResourceRequirements,
+    #[serde(default)]
+    checkpointable: bool,
+    #[serde(default)]
+    restartable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deadline_at: Option<String>,
 }
 
 #[tool_router]
@@ -440,6 +469,57 @@ impl ClinicalServer {
                 tool_name: "clinical.record_review_decision".into(),
                 arguments,
                 context_grant_id: Some(input.context_grant_id),
+                approval_ticket: Some(input.approval_ticket),
+                idempotency_key: Some(input.idempotency_key),
+                now_epoch_seconds,
+            })
+            .await
+            .map(rmcp::Json)
+            .map_err(|error| protocol_error(&error))
+    }
+
+    #[tool(
+        name = "clinical.submit_compute_request",
+        description = "Submit a compute request to ModelForge's compute-control-plane scheduler. Requires a single-use approval ticket and an idempotency key.",
+        annotations(
+            title = "Submit compute request",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn submit_compute_request(
+        &self,
+        Parameters(input): Parameters<SubmitComputeRequestInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<rmcp::Json<OperationResponse>, ErrorData> {
+        let subject = parts
+            .extensions
+            .get::<SubjectContext>()
+            .cloned()
+            .ok_or_else(|| ErrorData::invalid_request("verified identity is unavailable", None))?;
+        let now_epoch_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ErrorData::internal_error("system clock is unavailable", None))?
+            .as_secs();
+        let arguments = serde_json::to_value(ComputeSubmitArguments {
+            pool_id: input.pool_id,
+            workload_kind: input.workload_kind,
+            priority: input.priority,
+            profile: input.profile,
+            requirements: input.requirements,
+            checkpointable: input.checkpointable,
+            restartable: input.restartable,
+            deadline_at: input.deadline_at,
+        })
+        .map_err(|_| ErrorData::invalid_params("invalid clinical input", None))?;
+        self.gateway
+            .execute(AdmissionRequest {
+                subject,
+                tool_name: "clinical.submit_compute_request".into(),
+                arguments,
+                context_grant_id: None,
                 approval_ticket: Some(input.approval_ticket),
                 idempotency_key: Some(input.idempotency_key),
                 now_epoch_seconds,

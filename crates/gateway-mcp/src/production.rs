@@ -6,11 +6,12 @@
 use std::{path::PathBuf, sync::Arc};
 
 use modelforge_clinical_mcp_core::{
-    BuiltInMedicationConflictService, ClinicalDomainAdapter, DomainAdapter, DomainRouter,
-    FileAuditSink, Gateway, HmacApprovalVerifier, HttpGrantResolver, HttpReviewDecisionService,
+    BuiltInMedicationConflictService, ClinicalDomainAdapter, ComputeDomainAdapter,
+    ComputeSubmitService, DomainAdapter, DomainRouter, FileAuditSink, Gateway,
+    HmacApprovalVerifier, HttpComputeSubmitService, HttpGrantResolver, HttpReviewDecisionService,
     InMemoryIdempotencyStore, PolicySet, PolicySnapshot, ReviewDecisionService,
-    ReviewDomainAdapter, RuntimeDomainAdapter, TenantPolicy, UnconfiguredReviewDecisionService,
-    UnconfiguredRuntimeDiagnostics,
+    ReviewDomainAdapter, RuntimeDomainAdapter, TenantPolicy, UnconfiguredComputeSubmitService,
+    UnconfiguredReviewDecisionService, UnconfiguredRuntimeDiagnostics,
 };
 use serde::Deserialize;
 
@@ -26,6 +27,10 @@ pub struct ClinicalPortsConfig {
     /// unset, the tool stays listed and reachable but fails closed
     /// ([`UnconfiguredReviewDecisionService`]) instead of silently discarding decisions.
     pub review_service_url: Option<String>,
+    /// Optional, independent of `review_service_url`: enables `clinical.submit_compute_request`.
+    /// Left unset, the tool stays listed and reachable but fails closed
+    /// ([`UnconfiguredComputeSubmitService`]) instead of fabricating a placement decision.
+    pub compute_service_url: Option<String>,
 }
 
 impl ClinicalPortsConfig {
@@ -62,6 +67,7 @@ impl ClinicalPortsConfig {
                 audit_log_path: PathBuf::from(audit_log_path),
                 approval_secret: approval_secret.into_bytes(),
                 review_service_url: std::env::var("MODELFORGE_MCP_REVIEW_SERVICE_URL").ok(),
+                compute_service_url: std::env::var("MODELFORGE_MCP_COMPUTE_SERVICE_URL").ok(),
             })),
             _ => anyhow::bail!(
                 "MODELFORGE_MCP_POLICY_PATH, MODELFORGE_MCP_GRANT_SERVICE_URL, \
@@ -157,6 +163,15 @@ pub async fn build_clinical_gateway(config: ClinicalPortsConfig) -> anyhow::Resu
             None => Arc::new(UnconfiguredReviewDecisionService),
         };
     let review_adapter: Arc<dyn DomainAdapter> = Arc::new(ReviewDomainAdapter::new(review_service));
+    let compute_service: Arc<dyn ComputeSubmitService> =
+        match config.compute_service_url {
+            Some(url) => Arc::new(HttpComputeSubmitService::new(url).map_err(|error| {
+                anyhow::anyhow!("invalid compute service configuration: {error}")
+            })?),
+            None => Arc::new(UnconfiguredComputeSubmitService),
+        };
+    let compute_adapter: Arc<dyn DomainAdapter> =
+        Arc::new(ComputeDomainAdapter::new(compute_service));
     let domain = DomainRouter::new()
         .with_route(
             "clinical.medication_conflict_check",
@@ -164,7 +179,8 @@ pub async fn build_clinical_gateway(config: ClinicalPortsConfig) -> anyhow::Resu
         )
         .with_route("clinical.response_contract_check", clinical_adapter)
         .with_route("runtime.diagnostics", runtime_adapter)
-        .with_route("clinical.record_review_decision", review_adapter);
+        .with_route("clinical.record_review_decision", review_adapter)
+        .with_route("clinical.submit_compute_request", compute_adapter);
 
     let gateway = Gateway::new(
         Arc::new(policy),

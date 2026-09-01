@@ -3,6 +3,7 @@
 mod approval;
 mod audit;
 mod catalog;
+mod compute;
 mod contracts;
 mod digest;
 mod error;
@@ -24,6 +25,12 @@ mod runtime;
 pub use approval::{ApprovalBinding, ApprovalVerifier, HmacApprovalVerifier};
 pub use audit::FileAuditSink;
 pub use catalog::{CATALOG_VERSION, catalog, catalog_entry};
+pub use compute::{
+    AcceleratorVendor, ComputeDomainAdapter, ComputePriority, ComputeRuntime,
+    ComputeSchedulingStatus, ComputeSubmitArguments, ComputeSubmitRequest, ComputeSubmitResult,
+    ComputeSubmitService, HttpComputeSubmitService, ResourceProfile, ResourceRequirements,
+    UnconfiguredComputeSubmitService,
+};
 pub use contracts::{
     AdmissionRequest, AuditEvent, AuditOutcome, CatalogEntry, ContextGrant, DestinationClass,
     EgressClass, OperationResponse, PolicySnapshot, RiskClass, SubjectContext,
