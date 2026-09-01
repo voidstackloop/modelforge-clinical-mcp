@@ -23,6 +23,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+mod production;
+
+pub use production::{ClinicalPortsConfig, build_clinical_gateway};
+
 /// Shared MCP handler used by every transport adapter.
 #[derive(Clone, Default)]
 pub struct BootstrapServer;

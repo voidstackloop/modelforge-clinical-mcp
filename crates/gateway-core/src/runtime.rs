@@ -48,6 +48,23 @@ pub trait RuntimeDiagnosticsService: Send + Sync {
     async fn diagnostics(&self) -> Result<RuntimeDiagnosticsResult, GatewayError>;
 }
 
+/// The design doc's stdio companion is meant to query its own already-running `ModelForge`
+/// desktop process "over an inherited, ACL-restricted channel" — an IPC bridge that doesn't
+/// exist on either side of this repository yet. Rather than fabricate runtime numbers with no
+/// real backing process, this default fails closed on every call so the tool stays listed and
+/// reachable (matching what a client expects from the catalog) but is honest that it isn't
+/// wired to anything real until a deployment supplies a genuine
+/// [`RuntimeDiagnosticsService`] backed by that bridge.
+#[derive(Default)]
+pub struct UnconfiguredRuntimeDiagnostics;
+
+#[async_trait]
+impl RuntimeDiagnosticsService for UnconfiguredRuntimeDiagnostics {
+    async fn diagnostics(&self) -> Result<RuntimeDiagnosticsResult, GatewayError> {
+        Err(GatewayError::DomainUnavailable)
+    }
+}
+
 /// Narrow adapter that can call only the runtime-diagnostics service port. Carries no PHI and
 /// requires no context grant: `runtime.diagnostics` has no `phi_fields` in the catalog.
 pub struct RuntimeDomainAdapter {

@@ -1,8 +1,10 @@
 use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use modelforge_clinical_mcp_http::{
-    JwksRefreshConfig, JwtAuthenticator, ManagedConfig, build_router, start_jwks_authenticator,
+    JwksRefreshConfig, JwtAuthenticator, ManagedConfig, build_clinical_router, build_router,
+    start_jwks_authenticator,
 };
+use modelforge_clinical_mcp_server::{ClinicalPortsConfig, build_clinical_gateway};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -65,7 +67,14 @@ async fn main() -> anyhow::Result<()> {
             "exactly one of MODELFORGE_MCP_OIDC_JWKS_URI or MODELFORGE_MCP_OIDC_PUBLIC_KEY_PEM must be set"
         ),
     };
-    let router = build_router(config, authenticator)?;
+    let router = if let Some(clinical_config) = ClinicalPortsConfig::from_env()? {
+        let gateway = build_clinical_gateway(clinical_config).await?;
+        tracing::info!("clinical gateway enabled");
+        build_clinical_router(config, authenticator, gateway)?
+    } else {
+        tracing::info!("clinical gateway not configured; serving bootstrap capabilities only");
+        build_router(config, authenticator)?
+    };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(address = %listener.local_addr()?, "managed MCP gateway listening");
     axum::serve(listener, router)

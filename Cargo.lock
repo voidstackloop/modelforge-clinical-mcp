@@ -1003,6 +1003,8 @@ name = "modelforge-clinical-mcp-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "jsonwebtoken",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",
@@ -1041,12 +1043,14 @@ dependencies = [
 name = "modelforge-clinical-mcp-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "http",
  "modelforge-clinical-mcp-core",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

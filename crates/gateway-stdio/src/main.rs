@@ -1,4 +1,6 @@
-use modelforge_clinical_mcp_server::BootstrapServer;
+use modelforge_clinical_mcp_server::{
+    BootstrapServer, ClinicalPortsConfig, ClinicalServer, build_clinical_gateway,
+};
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::EnvFilter;
 
@@ -10,7 +12,15 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let service = BootstrapServer.serve(stdio()).await?;
-    service.waiting().await?;
+    if let Some(clinical_config) = ClinicalPortsConfig::from_env()? {
+        let gateway = build_clinical_gateway(clinical_config).await?;
+        tracing::info!("clinical gateway enabled");
+        let service = ClinicalServer::new(gateway).serve(stdio()).await?;
+        service.waiting().await?;
+    } else {
+        tracing::info!("clinical gateway not configured; serving bootstrap capabilities only");
+        let service = BootstrapServer.serve(stdio()).await?;
+        service.waiting().await?;
+    }
     Ok(())
 }

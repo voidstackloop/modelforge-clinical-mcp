@@ -43,16 +43,19 @@ The initial M1 slice contains:
   serving the same deterministic manifest as the `modelforge.capabilities` tool through
   `resources/list`/`resources/read` instead of `tools/call`;
 - terminal admitted, denied, succeeded, and failed audit outcomes without arguments or results;
+- real, non-test implementations of every trusted port `Gateway` needs: `BuiltInMedicationConflictService`
+  (ports the desktop app's own deterministic seed-list checker), `FileAuditSink` (durable,
+  fsynced JSON-lines audit log), `InMemoryIdempotencyStore` (race-safe reservation, not just a
+  presence check), `HmacApprovalVerifier` (signed, single-use approval tickets bound to the full
+  operation digest), and `HttpGrantResolver` (calls out to an existing ModelForge grant-issuing
+  service rather than storing grants itself);
+- both binaries construct a fully wired `Gateway` from those ports when configured (see "Clinical
+  gateway" below) and fall back to the unchanged bootstrap-only default otherwise — live-verified
+  end to end: real JWT → real tenant-policy authorization → real audit trail → real domain
+  dispatch, including a PHI tool correctly rejected without a resolvable grant;
 - tests for catalog determinism, grant binding, tenant isolation, kill switches, digest stability,
-  payload limits, trusted-context injection, domain routing, prompt rendering, resource reads, and
-  audit privacy.
-
-The stdio executable and default managed executable expose non-PHI capability discovery, the
-prompt catalog, and the capabilities resource. The clinical server composition is available as a
-library but is deliberately not the binary default: deployment must supply trusted policy, grant,
-audit, medication-service, and runtime-diagnostics ports. The desktop integration must likewise
-supply verified identity and grant
-resolution over an inherited, ACL-restricted channel before enabling clinical tools.
+  payload limits, trusted-context injection, domain routing, prompt rendering, resource reads,
+  idempotency reservation races, approval-ticket binding/expiry/replay, and audit privacy.
 
 ## Build
 
@@ -94,6 +97,64 @@ static-key deployment; setting both is rejected. The managed binary refuses to s
 security-critical setting is missing or invalid. It
 expects TLS to terminate at a trusted local proxy and validates the external Host and Origin values
 forwarded unchanged to the application. Private keys are neither required nor accepted.
+
+## Clinical gateway
+
+Both binaries default to the bootstrap-only surface above (capability discovery, prompts, the
+capabilities resource — no PHI). Setting all four of the following env vars switches either
+binary to the full `ClinicalServer`, wired to real ports; setting only some of them is a startup
+error rather than a silent partial configuration:
+
+```bash
+export MODELFORGE_MCP_POLICY_PATH=/etc/modelforge/clinical-policy.json
+export MODELFORGE_MCP_GRANT_SERVICE_URL=https://grants.example.com
+export MODELFORGE_MCP_AUDIT_LOG_PATH=/var/log/modelforge/clinical-audit.jsonl
+export MODELFORGE_MCP_APPROVAL_SECRET=<at least 32 random bytes>
+```
+
+`MODELFORGE_MCP_POLICY_PATH` points to a JSON tenant-policy file, loaded once at startup and
+validated the same way `PolicySet::new` validates it in tests:
+
+```json
+{
+  "policies": [
+    {
+      "organizationId": "org-3",
+      "tools": {
+        "clinical.medication_conflict_check": {
+          "allowedRoles": ["clinician"],
+          "requiredScopes": ["clinical:read"],
+          "allowedDestinations": ["local_model_forge"],
+          "allowedAuthenticationStrengths": []
+        }
+      }
+    }
+  ],
+  "snapshot": {
+    "registryVersion": "registry-1",
+    "rbacVersion": "rbac-1",
+    "egressPolicyVersion": "egress-1",
+    "killSwitchVersion": "kill-1",
+    "toolPolicyVersion": "tools-1"
+  },
+  "killSwitchActive": false
+}
+```
+
+`MODELFORGE_MCP_GRANT_SERVICE_URL` must be an `https://` origin; grants are looked up as
+`GET {url}/{grantId}` rather than stored by this repository. `MODELFORGE_MCP_APPROVAL_SECRET` signs
+and verifies approval tickets for the first `RiskClass::ControlledWrite` tool — none exist in the
+catalog yet, so this is infrastructure the moment one is added, not something exercised today.
+`runtime.diagnostics` stays reachable but always returns `domain_unavailable`: no IPC bridge to a
+running desktop process exists in this repository, and fabricating numbers would be worse than
+failing closed.
+
+**Known gap:** the managed HTTP adapter derives `SubjectContext` from a verified OIDC access
+token, so the chain above is complete for it. The stdio companion has no equivalent identity
+source yet — the design doc's "inherited, ACL-restricted channel" that the desktop app is meant to
+authenticate over doesn't exist on either side of this repository. Enabling the clinical gateway
+over stdio today means every tool call fails with "verified identity is unavailable" until the
+desktop integration supplies that channel.
 
 ## Docker
 

@@ -7,6 +7,7 @@ mod contracts;
 mod digest;
 mod error;
 mod gateway;
+mod grant_client;
 mod grants;
 mod idempotency;
 mod limits;
@@ -29,6 +30,7 @@ pub use contracts::{
 pub use digest::{arguments_digest, operation_digest};
 pub use error::GatewayError;
 pub use gateway::Gateway;
+pub use grant_client::HttpGrantResolver;
 pub use grants::{GrantSnapshot, GrantSnapshotError};
 pub use idempotency::InMemoryIdempotencyStore;
 pub use limits::PayloadLimits;
@@ -51,5 +53,5 @@ pub use response_contract::{
 pub use router::DomainRouter;
 pub use runtime::{
     RuntimeBackendDiagnostics, RuntimeDiagnosticsResult, RuntimeDiagnosticsService,
-    RuntimeDomainAdapter, RuntimeLifecycleState,
+    RuntimeDomainAdapter, RuntimeLifecycleState, UnconfiguredRuntimeDiagnostics,
 };

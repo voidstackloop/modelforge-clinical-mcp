@@ -300,6 +300,19 @@ async fn runtime_diagnostics_adapter_returns_bounded_non_secret_summary() {
 }
 
 #[tokio::test]
+async fn unconfigured_runtime_diagnostics_fails_closed_instead_of_fabricating_data() {
+    let adapter = RuntimeDomainAdapter::new(Arc::new(
+        modelforge_clinical_mcp_core::UnconfiguredRuntimeDiagnostics,
+    ));
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "runtime.diagnostics")
+        .expect("catalog entry");
+    let result = adapter.call(&subject(), &entry, None, json!({})).await;
+    assert_eq!(result.err(), Some(GatewayError::DomainUnavailable));
+}
+
+#[tokio::test]
 async fn runtime_diagnostics_adapter_rejects_excess_backends() {
     let adapter = RuntimeDomainAdapter::new(Arc::new(OverflowingRuntimeDiagnostics));
     let entry = catalog()
@@ -381,6 +394,21 @@ fn prompt_templates_append_mode_instruction_after_the_response_contract() {
 
     let compute_triage = ClinicalPromptTemplate::ComputeIncidentTriage.render();
     assert!(compute_triage.contains("bounded runtime diagnostics"));
+}
+
+#[test]
+fn http_grant_resolver_rejects_a_non_https_base_url() {
+    assert!(modelforge_clinical_mcp_core::HttpGrantResolver::new("http://grants.test").is_err());
+}
+
+#[tokio::test]
+async fn http_grant_resolver_rejects_a_grant_id_with_path_or_query_characters() {
+    let resolver = modelforge_clinical_mcp_core::HttpGrantResolver::new("https://grants.test")
+        .expect("valid base url");
+    for malformed in ["", "grant/1", "grant?x=1", "grant#frag"] {
+        let result = resolver.resolve(malformed).await;
+        assert_eq!(result.err(), Some(GatewayError::ContextGrantUnavailable));
+    }
 }
 
 fn approval_binding() -> ApprovalBinding<'static> {
