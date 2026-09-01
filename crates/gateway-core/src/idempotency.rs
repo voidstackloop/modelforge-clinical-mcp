@@ -1,16 +1,17 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::{GatewayError, IdempotencyAdmission, IdempotencyScope, IdempotencyStore};
+use crate::{
+    GatewayError, IdempotencyAdmission, IdempotencyScope, IdempotencyStore, IdempotentCompletion,
+};
 
 enum State {
     InProgress,
     Completed {
         arguments_digest: String,
-        result: Value,
+        completion: IdempotentCompletion,
     },
 }
 
@@ -37,10 +38,10 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
         match scopes.get(scope) {
             Some(State::Completed {
                 arguments_digest: stored_digest,
-                result,
+                completion,
             }) => {
                 if stored_digest == arguments_digest {
-                    Ok(IdempotencyAdmission::Replay(result.clone()))
+                    Ok(IdempotencyAdmission::Replay(completion.clone()))
                 } else {
                     Err(GatewayError::IdempotencyKeyReused)
                 }
@@ -57,13 +58,13 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
         &self,
         scope: &IdempotencyScope,
         arguments_digest: &str,
-        result: &Value,
+        completion: IdempotentCompletion,
     ) -> Result<(), GatewayError> {
         self.scopes.lock().await.insert(
             scope.clone(),
             State::Completed {
                 arguments_digest: arguments_digest.to_owned(),
-                result: result.clone(),
+                completion,
             },
         );
         Ok(())

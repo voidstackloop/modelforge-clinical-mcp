@@ -14,10 +14,12 @@ use modelforge_clinical_mcp_core::{
     BuiltInMedicationConflictService, CatalogEntry, ClinicalDomainAdapter, ClinicalPromptTemplate,
     ContextGrant, DestinationClass, DomainAdapter, DomainRouter, EgressClass, FileAuditSink,
     Gateway, GatewayError, GrantResolver, GrantSnapshot, HmacApprovalVerifier,
-    IdempotencyAdmission, IdempotencyScope, IdempotencyStore, InMemoryIdempotencyStore,
-    MedicationCheckStatus, MedicationConflictRequest, MedicationConflictResult,
-    MedicationConflictService, MedicationConflictWarning, MedicationConflictWarningKind,
-    PolicyEngine, PolicySet, PolicySnapshot, RiskClass, RuntimeBackendDiagnostics,
+    HttpReviewDecisionService, IdempotencyAdmission, IdempotencyScope, IdempotencyStore,
+    IdempotentCompletion, InMemoryIdempotencyStore, MedicationCheckStatus,
+    MedicationConflictRequest, MedicationConflictResult, MedicationConflictService,
+    MedicationConflictWarning, MedicationConflictWarningKind, PolicyEngine, PolicySet,
+    PolicySnapshot, ReviewDecisionOutcome, ReviewDecisionRequest, ReviewDecisionResult,
+    ReviewDecisionService, ReviewDomainAdapter, RiskClass, RuntimeBackendDiagnostics,
     RuntimeDiagnosticsResult, RuntimeDiagnosticsService, RuntimeDomainAdapter,
     RuntimeLifecycleState, SubjectContext, TenantPolicy, ToolEntitlement, catalog,
     check_response_contract_compliance, clinical_response_contract_prompt, operation_digest,
@@ -496,6 +498,14 @@ fn idempotency_scope() -> IdempotencyScope {
     }
 }
 
+fn test_completion(result: Value) -> IdempotentCompletion {
+    IdempotentCompletion {
+        operation_digest: "sha256:test-operation-digest".into(),
+        policy_snapshot: policy_snapshot(),
+        result,
+    }
+}
+
 #[tokio::test]
 async fn idempotency_store_replays_the_stored_result_for_a_matching_digest() {
     let store = InMemoryIdempotencyStore::default();
@@ -505,14 +515,14 @@ async fn idempotency_store_replays_the_stored_result_for_a_matching_digest() {
         Ok(IdempotencyAdmission::Fresh)
     ));
     store
-        .complete(&scope, "digest-a", &json!({"ok": true}))
+        .complete(&scope, "digest-a", test_completion(json!({"ok": true})))
         .await
         .expect("complete");
 
     let replay = store.begin(&scope, "digest-a").await;
     assert!(matches!(
         replay,
-        Ok(IdempotencyAdmission::Replay(ref value)) if *value == json!({"ok": true})
+        Ok(IdempotencyAdmission::Replay(ref completion)) if completion.result == json!({"ok": true})
     ));
 }
 
@@ -522,7 +532,7 @@ async fn idempotency_store_rejects_a_reused_key_with_different_arguments() {
     let scope = idempotency_scope();
     store.begin(&scope, "digest-a").await.expect("first begin");
     store
-        .complete(&scope, "digest-a", &json!({"ok": true}))
+        .complete(&scope, "digest-a", test_completion(json!({"ok": true})))
         .await
         .expect("complete");
 
@@ -1099,4 +1109,321 @@ async fn denied_operation_emits_phi_free_terminal_audit_event() {
             .unwrap_or_default()
             .contains("secret-drug")
     );
+}
+
+#[test]
+fn http_review_decision_service_rejects_a_non_https_base_url() {
+    assert!(HttpReviewDecisionService::new("http://reviews.test").is_err());
+}
+
+#[derive(Default)]
+struct CapturingReviewService(Mutex<Vec<ReviewDecisionRequest>>);
+
+#[async_trait]
+impl ReviewDecisionService for CapturingReviewService {
+    async fn record(
+        &self,
+        request: ReviewDecisionRequest,
+    ) -> Result<ReviewDecisionResult, GatewayError> {
+        let review_id = uuid::Uuid::new_v4();
+        let decision = request.decision;
+        self.0
+            .lock()
+            .map_err(|_| GatewayError::DomainUnavailable)?
+            .push(request);
+        Ok(ReviewDecisionResult {
+            review_id,
+            decision,
+        })
+    }
+}
+
+#[tokio::test]
+async fn review_domain_adapter_injects_reviewer_and_case_from_trusted_context() {
+    let service = Arc::new(CapturingReviewService::default());
+    let adapter = ReviewDomainAdapter::new(service.clone());
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.record_review_decision")
+        .expect("catalog entry");
+    assert_eq!(entry.risk, RiskClass::ControlledWrite);
+    assert!(entry.idempotency_required);
+
+    adapter
+        .call(
+            &subject(),
+            &entry,
+            Some(&medication_grant()),
+            json!({
+                "reviewedOperationId": "11111111-1111-1111-1111-111111111111",
+                "decision": "approved",
+                "rationale": "Dosage confirmed correct for renal function."
+            }),
+        )
+        .await
+        .expect("adapter result");
+    let captured = service
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.reviewer_subject_id, "clinician-7");
+    assert_eq!(request.case_id, "case-9");
+    assert_eq!(request.organization_id, "org-3");
+    assert_eq!(request.decision, ReviewDecisionOutcome::Approved);
+}
+
+#[tokio::test]
+async fn review_domain_adapter_rejects_empty_or_oversized_rationale() {
+    let adapter = ReviewDomainAdapter::new(Arc::new(CapturingReviewService::default()));
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.record_review_decision")
+        .expect("catalog entry");
+
+    let empty = adapter
+        .call(
+            &subject(),
+            &entry,
+            Some(&medication_grant()),
+            json!({
+                "reviewedOperationId": "11111111-1111-1111-1111-111111111111",
+                "decision": "approved",
+                "rationale": "   "
+            }),
+        )
+        .await;
+    assert!(matches!(empty, Err(GatewayError::PayloadRejected(_))));
+
+    let oversized = adapter
+        .call(
+            &subject(),
+            &entry,
+            Some(&medication_grant()),
+            json!({
+                "reviewedOperationId": "11111111-1111-1111-1111-111111111111",
+                "decision": "approved",
+                "rationale": "x".repeat(2_001)
+            }),
+        )
+        .await;
+    assert!(matches!(oversized, Err(GatewayError::PayloadRejected(_))));
+}
+
+fn review_decision_grant() -> ContextGrant {
+    ContextGrant {
+        id: "grant-review".into(),
+        subject_id: "clinician-7".into(),
+        client_id: "desktop-2".into(),
+        organization_id: "org-3".into(),
+        case_id: "case-9".into(),
+        allowed_tools: BTreeSet::from(["clinical.record_review_decision".into()]),
+        allowed_fields: BTreeSet::from(["rationale".into()]),
+        purpose: "review decision".into(),
+        destination: DestinationClass::LocalModelForge,
+        expires_at_epoch_seconds: 5_000,
+        version: 1,
+    }
+}
+
+fn review_decision_tenant_policy() -> TenantPolicy {
+    TenantPolicy {
+        organization_id: "org-3".into(),
+        tools: [(
+            "clinical.record_review_decision".into(),
+            ToolEntitlement {
+                allowed_roles: BTreeSet::from(["clinician".into()]),
+                required_scopes: BTreeSet::from(["clinical:read".into()]),
+                allowed_destinations: BTreeSet::from([DestinationClass::LocalModelForge]),
+                allowed_authentication_strengths: BTreeSet::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+fn review_decision_arguments() -> Value {
+    json!({
+        "reviewedOperationId": "11111111-1111-1111-1111-111111111111",
+        "decision": "approved",
+        "rationale": "Dosage confirmed correct for renal function."
+    })
+}
+
+/// End to end through the public `Gateway::execute()` API — the first real catalog entry that
+/// is both `RiskClass::ControlledWrite` and `idempotency_required: true`, so this is the first
+/// test able to exercise the approval-ticket and idempotency machinery through the actual
+/// admission path rather than by calling `Gateway`'s private methods directly.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a single connected scenario (no ticket, wrong digest, success, replay, reused key) sharing one gateway and one prior successful call; splitting it would duplicate that setup in each piece rather than shrink the test"
+)]
+#[tokio::test]
+async fn record_review_decision_requires_approval_and_deduplicates_via_idempotency_key() {
+    let policy = PolicySet::new([review_decision_tenant_policy()], policy_snapshot(), false)
+        .expect("valid policy");
+    let approval = Arc::new(HmacApprovalVerifier::new(
+        b"test-secret-thats-well-over-32-bytes-long",
+    ));
+    let service = Arc::new(CapturingReviewService::default());
+    let audit = Arc::new(MemoryAudit::default());
+    let gateway = Gateway::new(
+        Arc::new(policy),
+        Arc::new(StaticGrant(review_decision_grant())),
+        Arc::new(ReviewDomainAdapter::new(service.clone())),
+        audit.clone(),
+    )
+    .with_idempotency_store(Arc::new(InMemoryIdempotencyStore::default()))
+    .with_approval_verifier(approval.clone());
+
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.record_review_decision")
+        .expect("catalog entry");
+    let arguments = review_decision_arguments();
+
+    // Missing approval ticket is rejected before the domain adapter is ever called.
+    let no_ticket = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: arguments.clone(),
+            context_grant_id: Some("grant-review".into()),
+            approval_ticket: None,
+            idempotency_key: Some("key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await;
+    assert_eq!(no_ticket.err(), Some(GatewayError::ApprovalRequired));
+    assert!(
+        service
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "domain adapter must not run without a valid approval ticket"
+    );
+
+    // The ticket must be bound to the exact operation digest, which depends on the resolved
+    // grant and policy snapshot — mint it against a placeholder and let verify_approval reject
+    // the mismatch, matching how a real caller would learn the required digest from a prior
+    // approval_required response rather than computing operation_digest itself.
+    let mismatched_ticket = approval
+        .issue(
+            &ApprovalBinding {
+                subject_id: "clinician-7",
+                client_id: "desktop-2",
+                tool_name: &entry.name,
+                operation_digest: "sha256:not-the-real-digest",
+            },
+            5_000,
+        )
+        .expect("issue ticket");
+    let wrong_digest = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: arguments.clone(),
+            context_grant_id: Some("grant-review".into()),
+            approval_ticket: Some(mismatched_ticket),
+            idempotency_key: Some("key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await;
+    assert_eq!(wrong_digest.err(), Some(GatewayError::ApprovalRequired));
+
+    // Compute the real digest the same way Gateway does, mint a ticket bound to it, and confirm
+    // the operation now succeeds, runs the domain adapter exactly once, and produces a real
+    // audit trail.
+    let snapshot = policy_snapshot();
+    let digest = operation_digest(
+        &entry.name,
+        &arguments,
+        &subject(),
+        Some(&review_decision_grant()),
+        &snapshot,
+    );
+    let ticket = approval
+        .issue(
+            &ApprovalBinding {
+                subject_id: "clinician-7",
+                client_id: "desktop-2",
+                tool_name: &entry.name,
+                operation_digest: &digest,
+            },
+            5_000,
+        )
+        .expect("issue ticket");
+    let first = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: arguments.clone(),
+            context_grant_id: Some("grant-review".into()),
+            approval_ticket: Some(ticket.clone()),
+            idempotency_key: Some("key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await
+        .expect("first execution succeeds");
+    assert_eq!(first.result["decision"], "approved");
+    assert_eq!(
+        service
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1
+    );
+
+    // The same ticket cannot be replayed even for a retried call (single-use), but the
+    // idempotency store already has a terminal result for this scope/digest, so the retry is
+    // served as a replay and never reaches verify_approval or the domain adapter again.
+    let retry = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: arguments.clone(),
+            context_grant_id: Some("grant-review".into()),
+            approval_ticket: None,
+            idempotency_key: Some("key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await
+        .expect("retry replays the stored result");
+    assert_eq!(retry.result, first.result);
+    assert_eq!(
+        service
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1,
+        "a replayed retry must not re-invoke the domain adapter"
+    );
+
+    // A reused idempotency key with different arguments is rejected outright.
+    let mut different_arguments = review_decision_arguments();
+    different_arguments["rationale"] = json!("A completely different rationale.");
+    let reused_key = gateway
+        .execute(AdmissionRequest {
+            subject: subject(),
+            tool_name: entry.name.clone(),
+            arguments: different_arguments,
+            context_grant_id: Some("grant-review".into()),
+            approval_ticket: None,
+            idempotency_key: Some("key-1".into()),
+            now_epoch_seconds: 1_000,
+        })
+        .await;
+    assert_eq!(reused_key.err(), Some(GatewayError::IdempotencyKeyReused));
+
+    let events = audit
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let serialized = serde_json::to_string(&*events).unwrap_or_default();
+    assert!(!serialized.contains("Dosage confirmed"));
+    assert!(!serialized.contains("renal function"));
 }

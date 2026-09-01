@@ -17,6 +17,7 @@ mod policy;
 mod ports;
 mod prompts;
 mod response_contract;
+mod review;
 mod router;
 mod runtime;
 
@@ -43,12 +44,16 @@ pub use medication_safety::BuiltInMedicationConflictService;
 pub use policy::{PolicySet, PolicySetError, TenantPolicy, ToolEntitlement};
 pub use ports::{
     AuditSink, DomainAdapter, GrantResolver, IdempotencyAdmission, IdempotencyScope,
-    IdempotencyStore, PolicyEngine,
+    IdempotencyStore, IdempotentCompletion, PolicyEngine,
 };
 pub use prompts::{ClinicalPromptTemplate, clinical_response_contract_prompt};
 pub use response_contract::{
     RESPONSE_CONTRACT_SECTION_HEADINGS, ResponseContractCheckArguments,
     ResponseContractCheckResult, check_response_contract_compliance,
+};
+pub use review::{
+    HttpReviewDecisionService, ReviewDecisionArguments, ReviewDecisionOutcome,
+    ReviewDecisionRequest, ReviewDecisionResult, ReviewDecisionService, ReviewDomainAdapter,
 };
 pub use router::DomainRouter;
 pub use runtime::{

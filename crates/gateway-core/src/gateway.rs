@@ -1,12 +1,13 @@
 use std::{ops::ControlFlow, sync::Arc};
 
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
     AdmissionRequest, ApprovalBinding, ApprovalVerifier, AuditEvent, AuditOutcome, AuditSink,
     CatalogEntry, DomainAdapter, GatewayError, GrantResolver, IdempotencyAdmission,
-    IdempotencyScope, IdempotencyStore, OperationResponse, PayloadLimits, PolicyEngine,
-    PolicySnapshot, RiskClass, arguments_digest, catalog_entry, operation_digest,
+    IdempotencyScope, IdempotencyStore, IdempotentCompletion, OperationResponse, PayloadLimits,
+    PolicyEngine, PolicySnapshot, RiskClass, arguments_digest, catalog_entry, operation_digest,
 };
 
 pub struct Gateway {
@@ -81,50 +82,21 @@ impl Gateway {
             return Err(GatewayError::UnknownOperation);
         };
 
-        let admission = self.admit(&request, &entry).await;
-        let (grant, snapshot) = match admission {
-            Ok(admission) => admission,
-            Err(error) => {
-                self.record_outcome(
-                    operation_id,
-                    &request,
-                    &entry,
-                    AuditOutcome::Denied,
-                    None,
-                    Some(error.error_class()),
-                )
-                .await?;
-                return Err(error);
-            }
-        };
-        let digest = operation_digest(
-            &entry.name,
-            &request.arguments,
-            &request.subject,
-            grant.as_ref(),
-            &snapshot,
-        );
-
-        self.check_approval(operation_id, &request, &entry, &digest, &snapshot)
-            .await?;
-
-        self.record_outcome(
-            operation_id,
-            &request,
-            &entry,
-            AuditOutcome::Admitted,
-            Some(&snapshot.tool_policy_version),
-            None,
-        )
-        .await?;
-
-        let idempotency = match self
-            .resolve_idempotency(operation_id, &request, &entry, &digest, &snapshot)
+        // Idempotency resolution runs before admission and approval, not after: a replay must
+        // return the frozen original result without re-authorizing and, critically, without
+        // requiring a fresh approval ticket — tickets are single-use, so a retry that had to
+        // present a valid one could never actually succeed. See `resolve_idempotency`.
+        let idempotency_scope = match self
+            .resolve_idempotency(operation_id, &request, &entry)
             .await?
         {
             ControlFlow::Break(response) => return Ok(response),
             ControlFlow::Continue(scope) => scope,
         };
+
+        let (grant, snapshot, digest) = self
+            .admit_and_approve(operation_id, &request, &entry, idempotency_scope.as_ref())
+            .await?;
 
         let execution = self
             .domain
@@ -142,9 +114,7 @@ impl Gateway {
         let result = match execution {
             Ok(result) => result,
             Err(error) => {
-                if let (Some(scope), Some(store)) = (&idempotency, &self.idempotency) {
-                    store.abort(scope).await?;
-                }
+                self.abort_idempotency(idempotency_scope.as_ref()).await?;
                 self.record_outcome(
                     operation_id,
                     &request,
@@ -158,10 +128,15 @@ impl Gateway {
             }
         };
 
-        if let (Some(scope), Some(store)) = (&idempotency, &self.idempotency) {
-            let digest = arguments_digest(&entry.name, &request.arguments);
-            store.complete(scope, &digest, &result).await?;
-        }
+        self.complete_idempotency(
+            idempotency_scope.as_ref(),
+            &request,
+            &entry,
+            &digest,
+            &snapshot,
+            &result,
+        )
+        .await?;
 
         self.record_outcome(
             operation_id,
@@ -201,49 +176,114 @@ impl Gateway {
             .await
     }
 
-    /// Resolves the idempotency admission for `entry`, if it requires one. Returns
-    /// [`ControlFlow::Break`] with the response `execute` should return immediately (an exact
-    /// replay), or [`ControlFlow::Continue`] with the reserved scope (if any) `execute` must
-    /// later `complete` or `abort`.
+    /// Runs `admit` and `verify_approval`, recording a `Denied` audit event (and releasing
+    /// `idempotency_scope`, if any) on either failure before propagating the error, or an
+    /// `Admitted` event on success. Returns the resolved grant, policy snapshot, and operation
+    /// digest for the caller to proceed with the actual domain call.
+    async fn admit_and_approve(
+        &self,
+        operation_id: Uuid,
+        request: &AdmissionRequest,
+        entry: &CatalogEntry,
+        idempotency_scope: Option<&IdempotencyScope>,
+    ) -> Result<(Option<crate::ContextGrant>, PolicySnapshot, String), GatewayError> {
+        let admission = self.admit(request, entry).await;
+        let (grant, snapshot) = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.abort_idempotency(idempotency_scope).await?;
+                self.record_outcome(
+                    operation_id,
+                    request,
+                    entry,
+                    AuditOutcome::Denied,
+                    None,
+                    Some(error.error_class()),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let digest = operation_digest(
+            &entry.name,
+            &request.arguments,
+            &request.subject,
+            grant.as_ref(),
+            &snapshot,
+        );
+
+        if let Err(error) = self.verify_approval(request, entry, &digest).await {
+            self.abort_idempotency(idempotency_scope).await?;
+            self.record_outcome(
+                operation_id,
+                request,
+                entry,
+                AuditOutcome::Denied,
+                Some(&snapshot.tool_policy_version),
+                Some(error.error_class()),
+            )
+            .await?;
+            return Err(error);
+        }
+
+        self.record_outcome(
+            operation_id,
+            request,
+            entry,
+            AuditOutcome::Admitted,
+            Some(&snapshot.tool_policy_version),
+            None,
+        )
+        .await?;
+
+        Ok((grant, snapshot, digest))
+    }
+
+    /// Resolves the idempotency admission for `entry`, if it requires one, *before* admission
+    /// or approval run at all. Returns [`ControlFlow::Break`] with the response `execute`
+    /// should return immediately (an exact replay of the original call's frozen result, with no
+    /// re-authorization and no fresh approval ticket required), or [`ControlFlow::Continue`]
+    /// with the reserved scope (if any) `execute` must later `complete` or `abort`.
     async fn resolve_idempotency(
         &self,
         operation_id: Uuid,
         request: &AdmissionRequest,
         entry: &CatalogEntry,
-        digest: &str,
-        snapshot: &PolicySnapshot,
     ) -> Result<ControlFlow<OperationResponse, Option<IdempotencyScope>>, GatewayError> {
         if !entry.idempotency_required {
             return Ok(ControlFlow::Continue(None));
         }
         match self.begin_idempotent(request, entry).await {
-            Ok(IdempotencyAdmission::Replay(result)) => {
+            Ok(IdempotencyAdmission::Replay(completion)) => {
                 self.record_outcome(
                     operation_id,
                     request,
                     entry,
                     AuditOutcome::Succeeded,
-                    Some(&snapshot.tool_policy_version),
+                    Some(&completion.policy_snapshot.tool_policy_version),
                     None,
                 )
                 .await?;
                 Ok(ControlFlow::Break(OperationResponse {
                     operation_id,
-                    operation_digest: digest.to_owned(),
-                    policy_snapshot: snapshot.clone(),
-                    result,
+                    operation_digest: completion.operation_digest,
+                    policy_snapshot: completion.policy_snapshot,
+                    result: completion.result,
                 }))
             }
             Ok(IdempotencyAdmission::Fresh) => Ok(ControlFlow::Continue(Some(idempotent_scope(
                 request, entry,
             )?))),
             Err(error) => {
+                // No admission has happened yet at this point, so there is no policy version to
+                // report — matching how the UnknownOperation and admit()-failure denial paths
+                // both use `None` for a pre-authorization denial.
                 self.record_outcome(
                     operation_id,
                     request,
                     entry,
                     AuditOutcome::Denied,
-                    Some(&snapshot.tool_policy_version),
+                    None,
                     Some(error.error_class()),
                 )
                 .await?;
@@ -264,6 +304,42 @@ impl Gateway {
         let scope = idempotent_scope(request, entry)?;
         let digest = arguments_digest(&entry.name, &request.arguments);
         store.begin(&scope, &digest).await
+    }
+
+    async fn abort_idempotency(
+        &self,
+        scope: Option<&IdempotencyScope>,
+    ) -> Result<(), GatewayError> {
+        if let (Some(scope), Some(store)) = (scope, &self.idempotency) {
+            store.abort(scope).await?;
+        }
+        Ok(())
+    }
+
+    async fn complete_idempotency(
+        &self,
+        scope: Option<&IdempotencyScope>,
+        request: &AdmissionRequest,
+        entry: &CatalogEntry,
+        digest: &str,
+        snapshot: &PolicySnapshot,
+        result: &Value,
+    ) -> Result<(), GatewayError> {
+        if let (Some(scope), Some(store)) = (scope, &self.idempotency) {
+            let args_digest = arguments_digest(&entry.name, &request.arguments);
+            store
+                .complete(
+                    scope,
+                    &args_digest,
+                    IdempotentCompletion {
+                        operation_digest: digest.to_owned(),
+                        policy_snapshot: snapshot.clone(),
+                        result: result.clone(),
+                    },
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// Verifies the approval ticket for a `RiskClass::ControlledWrite` entry against the full
@@ -296,31 +372,6 @@ impl Gateway {
         verifier
             .verify_and_consume(ticket, &binding, request.now_epoch_seconds)
             .await
-    }
-
-    /// Runs `verify_approval` and records a `Denied` audit event on failure before propagating
-    /// the error, matching every other admission-denial path.
-    async fn check_approval(
-        &self,
-        operation_id: Uuid,
-        request: &AdmissionRequest,
-        entry: &CatalogEntry,
-        digest: &str,
-        snapshot: &PolicySnapshot,
-    ) -> Result<(), GatewayError> {
-        if let Err(error) = self.verify_approval(request, entry, digest).await {
-            self.record_outcome(
-                operation_id,
-                request,
-                entry,
-                AuditOutcome::Denied,
-                Some(&snapshot.tool_policy_version),
-                Some(error.error_class()),
-            )
-            .await?;
-            return Err(error);
-        }
-        Ok(())
     }
 
     async fn admit(

@@ -45,14 +45,29 @@ pub struct IdempotencyScope {
     pub idempotency_key: String,
 }
 
+/// Everything a replay needs to reconstruct the exact `OperationResponse` the original call
+/// returned, without re-running admission: the full `operation_digest` (distinct from the
+/// `arguments_digest` used for reuse detection — it also binds subject, grant, and policy
+/// version) and the `PolicySnapshot` frozen at the original admission.
+#[derive(Clone, Debug)]
+pub struct IdempotentCompletion {
+    pub operation_digest: String,
+    pub policy_snapshot: PolicySnapshot,
+    pub result: Value,
+}
+
 /// What `IdempotencyStore::begin` found for a scope.
 pub enum IdempotencyAdmission {
     /// No prior successful completion recorded for this scope; the caller must execute the
     /// operation and call `complete` with its result.
     Fresh,
     /// A prior call with the same scope and the same normalized-arguments digest already
-    /// completed successfully; replay its stored result instead of re-executing.
-    Replay(Value),
+    /// completed successfully; replay it instead of re-executing — and, critically, instead of
+    /// re-running admission or approval verification at all. A single-use approval ticket
+    /// cannot be presented again on a retry, so a replay that required re-approval could never
+    /// actually succeed; the design doc's "returns [the stored result] for exact replays" means
+    /// a replay bypasses re-approval by construction, not that it happens to reuse one.
+    Replay(IdempotentCompletion),
 }
 
 /// Backs the design doc's idempotency-key replay guarantee: "the server stores the first
@@ -65,8 +80,9 @@ pub enum IdempotencyAdmission {
 /// the same scope can never both observe [`IdempotencyAdmission::Fresh`] and race the
 /// underlying operation twice; the second concurrent caller gets
 /// [`GatewayError::IdempotencyOperationInProgress`] instead. A caller that reserved a `Fresh`
-/// scope but then fails must call `abort` so a later retry is free to start over rather than
-/// being stuck behind a reservation nothing will ever complete.
+/// scope but then fails (admission, approval, or the domain call itself) must call `abort` so a
+/// later retry is free to start over rather than being stuck behind a reservation nothing will
+/// ever complete.
 #[async_trait]
 pub trait IdempotencyStore: Send + Sync {
     /// Checks and reserves `scope` for `arguments_digest`.
@@ -83,7 +99,7 @@ pub trait IdempotencyStore: Send + Sync {
         arguments_digest: &str,
     ) -> Result<IdempotencyAdmission, GatewayError>;
 
-    /// Records the successful terminal result for a scope previously reserved via `begin`.
+    /// Records the successful terminal completion for a scope previously reserved via `begin`.
     ///
     /// # Errors
     ///
@@ -92,7 +108,7 @@ pub trait IdempotencyStore: Send + Sync {
         &self,
         scope: &IdempotencyScope,
         arguments_digest: &str,
-        result: &Value,
+        completion: IdempotentCompletion,
     ) -> Result<(), GatewayError>;
 
     /// Releases a reservation previously made via `begin` without completing it, so a later

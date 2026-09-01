@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::{CatalogEntry, EgressClass, RiskClass};
 
-pub const CATALOG_VERSION: &str = "2026-09-01.v1";
+pub const CATALOG_VERSION: &str = "2026-09-01.v2";
 
 #[must_use]
 pub fn catalog() -> Vec<CatalogEntry> {
@@ -12,6 +12,12 @@ pub fn catalog() -> Vec<CatalogEntry> {
             "Run ModelForge's deterministic medication conflict service and return provider limitations.",
             &["allergies", "medications"],
         ),
+        entry(
+            "clinical.record_review_decision",
+            "Record a clinician's review decision for a prior AI-assisted clinical operation.",
+            &["rationale"],
+        )
+        .into_controlled_write(),
         entry(
             "clinical.response_contract_check",
             "Check a clinical response against ModelForge's deterministic eight-section contract.",
@@ -48,5 +54,22 @@ fn entry(name: &str, description: &str, phi_fields: &[&str]) -> CatalogEntry {
             .map(|field| (*field).to_owned())
             .collect::<BTreeSet<_>>(),
         idempotency_required: false,
+    }
+}
+
+trait ControlledWrite {
+    /// Promotes a read-only draft entry to the design doc's "narrowly idempotent" controlled
+    /// write shape: `RiskClass::ControlledWrite` (requires an approval ticket) plus
+    /// `idempotency_required: true` (a retried write replays its first result instead of
+    /// re-executing). Egress stays `None`: recording a review decision is internal
+    /// record-keeping, never a remote disclosure.
+    fn into_controlled_write(self) -> Self;
+}
+
+impl ControlledWrite for CatalogEntry {
+    fn into_controlled_write(mut self) -> Self {
+        self.risk = RiskClass::ControlledWrite;
+        self.idempotency_required = true;
+        self
     }
 }
