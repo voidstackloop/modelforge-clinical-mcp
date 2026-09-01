@@ -10,17 +10,17 @@ use std::{
 
 use async_trait::async_trait;
 use modelforge_clinical_mcp_core::{
-    AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, BuiltInMedicationConflictService,
-    CatalogEntry, ClinicalDomainAdapter, ClinicalPromptTemplate, ContextGrant, DestinationClass,
-    DomainAdapter, DomainRouter, EgressClass, FileAuditSink, Gateway, GatewayError, GrantResolver,
-    GrantSnapshot, IdempotencyAdmission, IdempotencyScope, IdempotencyStore,
-    InMemoryIdempotencyStore, MedicationCheckStatus, MedicationConflictRequest,
-    MedicationConflictResult, MedicationConflictService, MedicationConflictWarning,
-    MedicationConflictWarningKind, PolicyEngine, PolicySet, PolicySnapshot, RiskClass,
-    RuntimeBackendDiagnostics, RuntimeDiagnosticsResult, RuntimeDiagnosticsService,
-    RuntimeDomainAdapter, RuntimeLifecycleState, SubjectContext, TenantPolicy, ToolEntitlement,
-    catalog, check_response_contract_compliance, clinical_response_contract_prompt,
-    operation_digest,
+    AdmissionRequest, ApprovalBinding, ApprovalVerifier, AuditEvent, AuditOutcome, AuditSink,
+    BuiltInMedicationConflictService, CatalogEntry, ClinicalDomainAdapter, ClinicalPromptTemplate,
+    ContextGrant, DestinationClass, DomainAdapter, DomainRouter, EgressClass, FileAuditSink,
+    Gateway, GatewayError, GrantResolver, GrantSnapshot, HmacApprovalVerifier,
+    IdempotencyAdmission, IdempotencyScope, IdempotencyStore, InMemoryIdempotencyStore,
+    MedicationCheckStatus, MedicationConflictRequest, MedicationConflictResult,
+    MedicationConflictService, MedicationConflictWarning, MedicationConflictWarningKind,
+    PolicyEngine, PolicySet, PolicySnapshot, RiskClass, RuntimeBackendDiagnostics,
+    RuntimeDiagnosticsResult, RuntimeDiagnosticsService, RuntimeDomainAdapter,
+    RuntimeLifecycleState, SubjectContext, TenantPolicy, ToolEntitlement, catalog,
+    check_response_contract_compliance, clinical_response_contract_prompt, operation_digest,
 };
 use serde_json::{Value, json};
 
@@ -381,6 +381,82 @@ fn prompt_templates_append_mode_instruction_after_the_response_contract() {
 
     let compute_triage = ClinicalPromptTemplate::ComputeIncidentTriage.render();
     assert!(compute_triage.contains("bounded runtime diagnostics"));
+}
+
+fn approval_binding() -> ApprovalBinding<'static> {
+    ApprovalBinding {
+        subject_id: "clinician-7",
+        client_id: "desktop-2",
+        tool_name: "clinical_orders.record_review_decision",
+        operation_digest: "sha256:deadbeef",
+    }
+}
+
+#[tokio::test]
+async fn hmac_approval_verifier_accepts_a_matching_freshly_issued_ticket() {
+    let verifier = HmacApprovalVerifier::new(b"test-secret");
+    let ticket = verifier
+        .issue(&approval_binding(), 2_000)
+        .expect("issue ticket");
+    verifier
+        .verify_and_consume(&ticket, &approval_binding(), 1_000)
+        .await
+        .expect("verify ticket");
+}
+
+#[tokio::test]
+async fn hmac_approval_verifier_rejects_a_ticket_reused_a_second_time() {
+    let verifier = HmacApprovalVerifier::new(b"test-secret");
+    let ticket = verifier
+        .issue(&approval_binding(), 2_000)
+        .expect("issue ticket");
+    verifier
+        .verify_and_consume(&ticket, &approval_binding(), 1_000)
+        .await
+        .expect("first use");
+    let replay = verifier
+        .verify_and_consume(&ticket, &approval_binding(), 1_000)
+        .await;
+    assert_eq!(replay.err(), Some(GatewayError::ApprovalRequired));
+}
+
+#[tokio::test]
+async fn hmac_approval_verifier_rejects_a_ticket_bound_to_a_different_operation() {
+    let verifier = HmacApprovalVerifier::new(b"test-secret");
+    let ticket = verifier
+        .issue(&approval_binding(), 2_000)
+        .expect("issue ticket");
+    let mut different_digest = approval_binding();
+    different_digest.operation_digest = "sha256:different";
+    let mismatched = verifier
+        .verify_and_consume(&ticket, &different_digest, 1_000)
+        .await;
+    assert_eq!(mismatched.err(), Some(GatewayError::ApprovalRequired));
+}
+
+#[tokio::test]
+async fn hmac_approval_verifier_rejects_an_expired_ticket() {
+    let verifier = HmacApprovalVerifier::new(b"test-secret");
+    let ticket = verifier
+        .issue(&approval_binding(), 1_000)
+        .expect("issue ticket");
+    let expired = verifier
+        .verify_and_consume(&ticket, &approval_binding(), 2_000)
+        .await;
+    assert_eq!(expired.err(), Some(GatewayError::ApprovalRequired));
+}
+
+#[tokio::test]
+async fn hmac_approval_verifier_rejects_a_ticket_signed_with_a_different_secret() {
+    let issuer = HmacApprovalVerifier::new(b"issuer-secret");
+    let verifier = HmacApprovalVerifier::new(b"verifier-secret");
+    let ticket = issuer
+        .issue(&approval_binding(), 2_000)
+        .expect("issue ticket");
+    let forged = verifier
+        .verify_and_consume(&ticket, &approval_binding(), 1_000)
+        .await;
+    assert_eq!(forged.err(), Some(GatewayError::ApprovalRequired));
 }
 
 fn idempotency_scope() -> IdempotencyScope {

@@ -538,7 +538,8 @@ fn protocol_error(error: &GatewayError) -> ErrorData {
         GatewayError::AuthorizationUnavailable
         | GatewayError::DomainUnavailable
         | GatewayError::AuditUnavailable
-        | GatewayError::IdempotencyStoreUnavailable => {
+        | GatewayError::IdempotencyStoreUnavailable
+        | GatewayError::ApprovalVerifierUnavailable => {
             ErrorData::internal_error("clinical dependency is unavailable", data)
         }
     }

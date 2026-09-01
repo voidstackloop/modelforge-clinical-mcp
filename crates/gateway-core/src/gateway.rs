@@ -3,10 +3,10 @@ use std::{ops::ControlFlow, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
-    AdmissionRequest, AuditEvent, AuditOutcome, AuditSink, CatalogEntry, DomainAdapter,
-    GatewayError, GrantResolver, IdempotencyAdmission, IdempotencyScope, IdempotencyStore,
-    OperationResponse, PayloadLimits, PolicyEngine, PolicySnapshot, RiskClass, arguments_digest,
-    catalog_entry, operation_digest,
+    AdmissionRequest, ApprovalBinding, ApprovalVerifier, AuditEvent, AuditOutcome, AuditSink,
+    CatalogEntry, DomainAdapter, GatewayError, GrantResolver, IdempotencyAdmission,
+    IdempotencyScope, IdempotencyStore, OperationResponse, PayloadLimits, PolicyEngine,
+    PolicySnapshot, RiskClass, arguments_digest, catalog_entry, operation_digest,
 };
 
 pub struct Gateway {
@@ -15,6 +15,7 @@ pub struct Gateway {
     domain: Arc<dyn DomainAdapter>,
     audit: Arc<dyn AuditSink>,
     idempotency: Option<Arc<dyn IdempotencyStore>>,
+    approval: Option<Arc<dyn ApprovalVerifier>>,
     limits: PayloadLimits,
 }
 
@@ -32,6 +33,7 @@ impl Gateway {
             domain,
             audit,
             idempotency: None,
+            approval: None,
             limits: PayloadLimits::default(),
         }
     }
@@ -49,6 +51,16 @@ impl Gateway {
     #[must_use]
     pub fn with_idempotency_store(mut self, idempotency: Arc<dyn IdempotencyStore>) -> Self {
         self.idempotency = Some(idempotency);
+        self
+    }
+
+    /// Configures the approval verifier required by any catalog entry with
+    /// `risk: RiskClass::ControlledWrite`. Without one, such an entry fails closed with
+    /// [`GatewayError::ApprovalVerifierUnavailable`] rather than accepting any non-empty ticket
+    /// string.
+    #[must_use]
+    pub fn with_approval_verifier(mut self, approval: Arc<dyn ApprovalVerifier>) -> Self {
+        self.approval = Some(approval);
         self
     }
 
@@ -92,6 +104,9 @@ impl Gateway {
             grant.as_ref(),
             &snapshot,
         );
+
+        self.check_approval(operation_id, &request, &entry, &digest, &snapshot)
+            .await?;
 
         self.record_outcome(
             operation_id,
@@ -251,6 +266,63 @@ impl Gateway {
         store.begin(&scope, &digest).await
     }
 
+    /// Verifies the approval ticket for a `RiskClass::ControlledWrite` entry against the full
+    /// `operation_digest` (already bound to subject, client, grant, and policy version), so a
+    /// ticket approved for one operation can never satisfy a different one. No-op for any other
+    /// risk class.
+    async fn verify_approval(
+        &self,
+        request: &AdmissionRequest,
+        entry: &CatalogEntry,
+        digest: &str,
+    ) -> Result<(), GatewayError> {
+        if entry.risk != RiskClass::ControlledWrite {
+            return Ok(());
+        }
+        let verifier = self
+            .approval
+            .as_ref()
+            .ok_or(GatewayError::ApprovalVerifierUnavailable)?;
+        let ticket = request
+            .approval_ticket
+            .as_deref()
+            .ok_or(GatewayError::ApprovalRequired)?;
+        let binding = ApprovalBinding {
+            subject_id: &request.subject.subject_id,
+            client_id: &request.subject.client_id,
+            tool_name: &entry.name,
+            operation_digest: digest,
+        };
+        verifier
+            .verify_and_consume(ticket, &binding, request.now_epoch_seconds)
+            .await
+    }
+
+    /// Runs `verify_approval` and records a `Denied` audit event on failure before propagating
+    /// the error, matching every other admission-denial path.
+    async fn check_approval(
+        &self,
+        operation_id: Uuid,
+        request: &AdmissionRequest,
+        entry: &CatalogEntry,
+        digest: &str,
+        snapshot: &PolicySnapshot,
+    ) -> Result<(), GatewayError> {
+        if let Err(error) = self.verify_approval(request, entry, digest).await {
+            self.record_outcome(
+                operation_id,
+                request,
+                entry,
+                AuditOutcome::Denied,
+                Some(&snapshot.tool_policy_version),
+                Some(error.error_class()),
+            )
+            .await?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn admit(
         &self,
         request: &AdmissionRequest,
@@ -331,6 +403,10 @@ fn idempotent_scope(
 // entry. Unit-testing `admit()` directly against a hand-built `CatalogEntry` is the only way to
 // cover this private defense-in-depth check.
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixtures use expect for immediate, contextual failures"
+)]
 mod tests {
     use std::collections::BTreeSet;
 
@@ -511,5 +587,87 @@ mod tests {
             different_key,
             Ok(crate::IdempotencyAdmission::Fresh)
         ));
+    }
+
+    #[tokio::test]
+    async fn verify_approval_fails_closed_without_a_configured_verifier() {
+        let gateway = Gateway::new(
+            std::sync::Arc::new(UnreachablePolicy),
+            std::sync::Arc::new(UnreachableGrants),
+            std::sync::Arc::new(UnreachableDomain),
+            std::sync::Arc::new(NullAudit),
+        );
+        let error = gateway
+            .verify_approval(
+                &idempotent_request("key-1"),
+                &idempotent_entry(),
+                "digest-a",
+            )
+            .await;
+        assert_eq!(error.err(), Some(GatewayError::ApprovalVerifierUnavailable));
+    }
+
+    #[tokio::test]
+    async fn verify_approval_is_a_no_op_for_non_controlled_write_risk() {
+        let gateway = Gateway::new(
+            std::sync::Arc::new(UnreachablePolicy),
+            std::sync::Arc::new(UnreachableGrants),
+            std::sync::Arc::new(UnreachableDomain),
+            std::sync::Arc::new(NullAudit),
+        );
+        let result = gateway
+            .verify_approval(
+                &AdmissionRequest {
+                    subject: subject(),
+                    tool_name: "clinical_orders.place".into(),
+                    arguments: json!({}),
+                    context_grant_id: None,
+                    approval_ticket: None,
+                    idempotency_key: None,
+                    now_epoch_seconds: 1_000,
+                },
+                &prohibited_entry(),
+                "digest-a",
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_approval_accepts_a_ticket_bound_to_the_exact_digest_and_rejects_others() {
+        let verifier = std::sync::Arc::new(crate::HmacApprovalVerifier::new(b"test-secret"));
+        let gateway = Gateway::new(
+            std::sync::Arc::new(UnreachablePolicy),
+            std::sync::Arc::new(UnreachableGrants),
+            std::sync::Arc::new(UnreachableDomain),
+            std::sync::Arc::new(NullAudit),
+        )
+        .with_approval_verifier(verifier.clone());
+        let entry = idempotent_entry();
+
+        let ticket = verifier
+            .issue(
+                &crate::ApprovalBinding {
+                    subject_id: &subject().subject_id,
+                    client_id: &subject().client_id,
+                    tool_name: &entry.name,
+                    operation_digest: "digest-a",
+                },
+                2_000,
+            )
+            .expect("issue ticket");
+        let mut request = idempotent_request("key-1");
+        request.approval_ticket = Some(ticket);
+
+        let wrong_digest = gateway.verify_approval(&request, &entry, "digest-b").await;
+        assert_eq!(wrong_digest.err(), Some(GatewayError::ApprovalRequired));
+
+        gateway
+            .verify_approval(&request, &entry, "digest-a")
+            .await
+            .expect("matching digest is accepted");
+
+        let reused = gateway.verify_approval(&request, &entry, "digest-a").await;
+        assert_eq!(reused.err(), Some(GatewayError::ApprovalRequired));
     }
 }

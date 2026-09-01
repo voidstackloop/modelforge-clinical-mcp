@@ -18,6 +18,8 @@ pub enum GatewayError {
     GrantScopeInsufficient,
     #[error("approval ticket is required")]
     ApprovalRequired,
+    #[error("approval verifier is unavailable")]
+    ApprovalVerifierUnavailable,
     #[error("idempotency key is required")]
     IdempotencyKeyRequired,
     #[error("idempotency key was reused with different arguments")]
@@ -48,6 +50,7 @@ impl GatewayError {
             Self::GrantExpired => "grant_expired",
             Self::GrantScopeInsufficient => "grant_scope_insufficient",
             Self::ApprovalRequired => "approval_required",
+            Self::ApprovalVerifierUnavailable => "approval_verifier_unavailable",
             Self::IdempotencyKeyRequired => "idempotency_key_required",
             Self::IdempotencyKeyReused => "idempotency_key_reused",
             Self::IdempotencyOperationInProgress => "idempotency_operation_in_progress",
