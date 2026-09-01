@@ -315,6 +315,30 @@ async fn unconfigured_runtime_diagnostics_fails_closed_instead_of_fabricating_da
 }
 
 #[tokio::test]
+async fn unconfigured_review_decision_service_fails_closed_instead_of_discarding_the_decision() {
+    let adapter = ReviewDomainAdapter::new(Arc::new(
+        modelforge_clinical_mcp_core::UnconfiguredReviewDecisionService,
+    ));
+    let entry = catalog()
+        .into_iter()
+        .find(|entry| entry.name == "clinical.record_review_decision")
+        .expect("catalog entry");
+    let result = adapter
+        .call(
+            &subject(),
+            &entry,
+            Some(&medication_grant()),
+            json!({
+                "reviewedOperationId": "11111111-1111-1111-1111-111111111111",
+                "decision": "approved",
+                "rationale": "Dosage confirmed correct for renal function."
+            }),
+        )
+        .await;
+    assert_eq!(result.err(), Some(GatewayError::DomainUnavailable));
+}
+
+#[tokio::test]
 async fn runtime_diagnostics_adapter_rejects_excess_backends() {
     let adapter = RuntimeDomainAdapter::new(Arc::new(OverflowingRuntimeDiagnostics));
     let entry = catalog()

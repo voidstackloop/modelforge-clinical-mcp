@@ -65,6 +65,24 @@ pub trait ReviewDecisionService: Send + Sync {
     ) -> Result<ReviewDecisionResult, GatewayError>;
 }
 
+/// Recording a review decision is optional infrastructure on top of the baseline clinical
+/// gateway (unlike policy/grant/audit, nothing else depends on it), so a deployment that hasn't
+/// configured a review service yet gets this: the tool stays listed and reachable but fails
+/// closed rather than silently discarding the decision or fabricating a review id, the same
+/// shape as [`crate::UnconfiguredRuntimeDiagnostics`].
+#[derive(Default)]
+pub struct UnconfiguredReviewDecisionService;
+
+#[async_trait]
+impl ReviewDecisionService for UnconfiguredReviewDecisionService {
+    async fn record(
+        &self,
+        _request: ReviewDecisionRequest,
+    ) -> Result<ReviewDecisionResult, GatewayError> {
+        Err(GatewayError::DomainUnavailable)
+    }
+}
+
 /// Narrow adapter that can call only the review-decision service port.
 pub struct ReviewDomainAdapter {
     reviews: Arc<dyn ReviewDecisionService>,

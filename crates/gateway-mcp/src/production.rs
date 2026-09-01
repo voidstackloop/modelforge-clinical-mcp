@@ -7,8 +7,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use modelforge_clinical_mcp_core::{
     BuiltInMedicationConflictService, ClinicalDomainAdapter, DomainAdapter, DomainRouter,
-    FileAuditSink, Gateway, HmacApprovalVerifier, HttpGrantResolver, InMemoryIdempotencyStore,
-    PolicySet, PolicySnapshot, RuntimeDomainAdapter, TenantPolicy, UnconfiguredRuntimeDiagnostics,
+    FileAuditSink, Gateway, HmacApprovalVerifier, HttpGrantResolver, HttpReviewDecisionService,
+    InMemoryIdempotencyStore, PolicySet, PolicySnapshot, ReviewDecisionService,
+    ReviewDomainAdapter, RuntimeDomainAdapter, TenantPolicy, UnconfiguredReviewDecisionService,
+    UnconfiguredRuntimeDiagnostics,
 };
 use serde::Deserialize;
 
@@ -19,6 +21,11 @@ pub struct ClinicalPortsConfig {
     pub grant_service_url: String,
     pub audit_log_path: PathBuf,
     pub approval_secret: Vec<u8>,
+    /// Optional: unlike the four fields above, `clinical.record_review_decision` is additional
+    /// capability on top of the baseline clinical gateway, not a prerequisite for it. Left
+    /// unset, the tool stays listed and reachable but fails closed
+    /// ([`UnconfiguredReviewDecisionService`]) instead of silently discarding decisions.
+    pub review_service_url: Option<String>,
 }
 
 impl ClinicalPortsConfig {
@@ -54,6 +61,7 @@ impl ClinicalPortsConfig {
                 grant_service_url,
                 audit_log_path: PathBuf::from(audit_log_path),
                 approval_secret: approval_secret.into_bytes(),
+                review_service_url: std::env::var("MODELFORGE_MCP_REVIEW_SERVICE_URL").ok(),
             })),
             _ => anyhow::bail!(
                 "MODELFORGE_MCP_POLICY_PATH, MODELFORGE_MCP_GRANT_SERVICE_URL, \
@@ -141,13 +149,22 @@ pub async fn build_clinical_gateway(config: ClinicalPortsConfig) -> anyhow::Resu
     let runtime_adapter: Arc<dyn DomainAdapter> = Arc::new(RuntimeDomainAdapter::new(Arc::new(
         UnconfiguredRuntimeDiagnostics,
     )));
+    let review_service: Arc<dyn ReviewDecisionService> =
+        match config.review_service_url {
+            Some(url) => Arc::new(HttpReviewDecisionService::new(url).map_err(|error| {
+                anyhow::anyhow!("invalid review service configuration: {error}")
+            })?),
+            None => Arc::new(UnconfiguredReviewDecisionService),
+        };
+    let review_adapter: Arc<dyn DomainAdapter> = Arc::new(ReviewDomainAdapter::new(review_service));
     let domain = DomainRouter::new()
         .with_route(
             "clinical.medication_conflict_check",
             clinical_adapter.clone(),
         )
         .with_route("clinical.response_contract_check", clinical_adapter)
-        .with_route("runtime.diagnostics", runtime_adapter);
+        .with_route("runtime.diagnostics", runtime_adapter)
+        .with_route("clinical.record_review_decision", review_adapter);
 
     let gateway = Gateway::new(
         Arc::new(policy),

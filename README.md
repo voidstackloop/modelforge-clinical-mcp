@@ -53,9 +53,15 @@ The initial M1 slice contains:
   gateway" below) and fall back to the unchanged bootstrap-only default otherwise — live-verified
   end to end: real JWT → real tenant-policy authorization → real audit trail → real domain
   dispatch, including a PHI tool correctly rejected without a resolvable grant;
+- `clinical.record_review_decision`, the first `RiskClass::ControlledWrite` tool in the catalog:
+  recording a clinician's decision on a prior AI-assisted operation, gated by a single-use
+  approval ticket and deduplicated by an idempotency key so a retry replays the original result
+  instead of recording a second decision;
 - tests for catalog determinism, grant binding, tenant isolation, kill switches, digest stability,
   payload limits, trusted-context injection, domain routing, prompt rendering, resource reads,
-  idempotency reservation races, approval-ticket binding/expiry/replay, and audit privacy.
+  idempotency reservation races, approval-ticket binding/expiry/replay, and audit privacy, plus an
+  end-to-end scenario test covering `clinical.record_review_decision`'s approval-then-idempotent-
+  replay path through the real catalog entry.
 
 ## Build
 
@@ -143,11 +149,26 @@ validated the same way `PolicySet::new` validates it in tests:
 
 `MODELFORGE_MCP_GRANT_SERVICE_URL` must be an `https://` origin; grants are looked up as
 `GET {url}/{grantId}` rather than stored by this repository. `MODELFORGE_MCP_APPROVAL_SECRET` signs
-and verifies approval tickets for the first `RiskClass::ControlledWrite` tool — none exist in the
-catalog yet, so this is infrastructure the moment one is added, not something exercised today.
+and verifies approval tickets for `clinical.record_review_decision`, the catalog's first
+`RiskClass::ControlledWrite` tool (see below).
 `runtime.diagnostics` stays reachable but always returns `domain_unavailable`: no IPC bridge to a
 running desktop process exists in this repository, and fabricating numbers would be worse than
 failing closed.
+
+An independently-optional fifth variable enables `clinical.record_review_decision`, which records a
+clinician's accept/override/reject decision on a prior AI-assisted operation:
+
+```bash
+export MODELFORGE_MCP_REVIEW_SERVICE_URL=https://reviews.example.com
+```
+
+Every call must carry a single-use `approvalTicket` — signed with `MODELFORGE_MCP_APPROVAL_SECRET`
+and bound to the exact operation, subject, client, grant, policy version, and expiry — and an
+`idempotencyKey` scoped to organization, subject, tool, and normalized arguments; a retry with the
+same key and arguments replays the stored terminal result instead of recording a second decision.
+Left unset, the tool stays listed and reachable but fails closed with `domain_unavailable` — the
+same "reachable but honest" pattern as `runtime.diagnostics` — rather than silently discarding a
+clinician's review decision.
 
 **Known gap:** the managed HTTP adapter derives `SubjectContext` from a verified OIDC access
 token, so the chain above is complete for it. The stdio companion has no equivalent identity

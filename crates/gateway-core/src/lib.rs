@@ -54,6 +54,7 @@ pub use response_contract::{
 pub use review::{
     HttpReviewDecisionService, ReviewDecisionArguments, ReviewDecisionOutcome,
     ReviewDecisionRequest, ReviewDecisionResult, ReviewDecisionService, ReviewDomainAdapter,
+    UnconfiguredReviewDecisionService,
 };
 pub use router::DomainRouter;
 pub use runtime::{

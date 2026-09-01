@@ -6,8 +6,8 @@ use std::{
 use http::request::Parts;
 use modelforge_clinical_mcp_core::{
     AdmissionRequest, CATALOG_VERSION, ClinicalPromptTemplate, Gateway, GatewayError,
-    MedicationConflictArguments, OperationResponse, ResponseContractCheckArguments, SubjectContext,
-    catalog,
+    MedicationConflictArguments, OperationResponse, ResponseContractCheckArguments,
+    ReviewDecisionArguments, ReviewDecisionOutcome, SubjectContext, catalog,
 };
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
@@ -252,8 +252,9 @@ impl ClinicalServer {
     }
 }
 
-const CLINICAL_ENABLED_TOOLS: [&str; 4] = [
+const CLINICAL_ENABLED_TOOLS: [&str; 5] = [
     "clinical.medication_conflict_check",
+    "clinical.record_review_decision",
     "clinical.response_contract_check",
     "modelforge.capabilities",
     "runtime.diagnostics",
@@ -272,6 +273,21 @@ struct MedicationConflictInput {
 struct ResponseContractCheckInput {
     context_grant_id: String,
     assistant_response: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordReviewDecisionInput {
+    context_grant_id: String,
+    /// Single-use ticket from `ModelForge`'s trusted UI, bound to this exact operation.
+    approval_ticket: String,
+    /// Caller-generated key scoped to organization, subject, tool, and normalized arguments —
+    /// a retry with the same key and arguments replays the original result instead of
+    /// recording a second decision.
+    idempotency_key: String,
+    reviewed_operation_id: uuid::Uuid,
+    decision: ReviewDecisionOutcome,
+    rationale: String,
 }
 
 #[tool_router]
@@ -380,6 +396,52 @@ impl ClinicalServer {
                 context_grant_id: Some(input.context_grant_id),
                 approval_ticket: None,
                 idempotency_key: None,
+                now_epoch_seconds,
+            })
+            .await
+            .map(rmcp::Json)
+            .map_err(|error| protocol_error(&error))
+    }
+
+    #[tool(
+        name = "clinical.record_review_decision",
+        description = "Record a clinician's review decision for a prior AI-assisted clinical operation. Requires a single-use approval ticket and an idempotency key.",
+        annotations(
+            title = "Record review decision",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn record_review_decision(
+        &self,
+        Parameters(input): Parameters<RecordReviewDecisionInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<rmcp::Json<OperationResponse>, ErrorData> {
+        let subject = parts
+            .extensions
+            .get::<SubjectContext>()
+            .cloned()
+            .ok_or_else(|| ErrorData::invalid_request("verified identity is unavailable", None))?;
+        let now_epoch_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ErrorData::internal_error("system clock is unavailable", None))?
+            .as_secs();
+        let arguments = serde_json::to_value(ReviewDecisionArguments {
+            reviewed_operation_id: input.reviewed_operation_id,
+            decision: input.decision,
+            rationale: input.rationale,
+        })
+        .map_err(|_| ErrorData::invalid_params("invalid clinical input", None))?;
+        self.gateway
+            .execute(AdmissionRequest {
+                subject,
+                tool_name: "clinical.record_review_decision".into(),
+                arguments,
+                context_grant_id: Some(input.context_grant_id),
+                approval_ticket: Some(input.approval_ticket),
+                idempotency_key: Some(input.idempotency_key),
                 now_epoch_seconds,
             })
             .await
