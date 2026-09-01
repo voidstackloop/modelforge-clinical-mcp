@@ -95,6 +95,38 @@ security-critical setting is missing or invalid. It
 expects TLS to terminate at a trusted local proxy and validates the external Host and Origin values
 forwarded unchanged to the application. Private keys are neither required nor accepted.
 
+## Docker
+
+`Dockerfile` is a multi-stage `cargo chef` build producing a ~63 MB distroless, non-root runtime
+image with both binaries; it defaults to running the managed HTTP adapter and fails closed exactly
+like the bare `cargo run` invocation above if required env vars are missing:
+
+```bash
+docker build -t modelforge-clinical-mcp .
+docker run --rm -p 8080:8080 \
+  -e MODELFORGE_MCP_BIND=0.0.0.0:8080 \
+  -e MODELFORGE_MCP_RESOURCE=https://mcp.example.com/mcp \
+  # ...remaining vars from the managed-adapter example above...
+  modelforge-clinical-mcp
+```
+
+`MODELFORGE_MCP_BIND` must be `0.0.0.0:<port>` in a container — `127.0.0.1:<port>` (correct for the
+bare-metal example above) would be unreachable from outside the container.
+
+`Dockerfile.dev` is a toolchain-only image (rustup + clippy + rustfmt + cargo-watch) for iterating
+with the source bind-mounted from the host; its default command re-runs this file's exact `fmt`/
+`test`/`clippy` pipeline on every change:
+
+```bash
+docker build -f Dockerfile.dev -t modelforge-clinical-mcp:dev .
+docker run --rm -it -v "$(pwd)":/workspace -v modelforge-clinical-mcp-target:/workspace/target \
+  modelforge-clinical-mcp:dev
+```
+
+Both base images are `rust:1.89-slim-bookworm` rather than the full `bookworm` variant, which ships
+hundreds of packages (docs, extra locales, unused CLI tools) this project never uses and that
+otherwise show up as avoidable CVEs in image scans.
+
 ## Security invariants
 
 - No inbound subject, organization, role, or scope is accepted from tool arguments.

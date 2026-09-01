@@ -1,0 +1,10 @@
+/target
+.git
+.gitignore
+.mcp.json
+*.log
+.env
+*.key
+*.pem
+.idea
+.vscode

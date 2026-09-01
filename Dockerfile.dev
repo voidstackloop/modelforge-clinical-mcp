@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+#
+# Development image for the ModelForge Clinical MCP Gateway.
+#
+# Provides the toolchain only — source is bind-mounted at run time so edits
+# on the host take effect immediately, and a named volume for /workspace/target
+# keeps incremental build state across container restarts. Default command
+# runs this project's exact documented build pipeline (see README.md "Build")
+# on every change: fmt check, clippy at the workspace's deny-level lints, then
+# the full test suite.
+#
+# Build:
+#   docker build -f Dockerfile.dev -t modelforge-clinical-mcp:dev .
+#
+# Run:
+#   docker run --rm -it \
+#     -v "$(pwd)":/workspace \
+#     -v modelforge-clinical-mcp-target:/workspace/target \
+#     modelforge-clinical-mcp:dev
+#
+# Drop into a shell instead of the watch loop:
+#   docker run --rm -it \
+#     -v "$(pwd)":/workspace \
+#     -v modelforge-clinical-mcp-target:/workspace/target \
+#     modelforge-clinical-mcp:dev bash
+#
+# Run the managed HTTP adapter for local testing (see Dockerfile's required
+# env vars — same fail-closed startup validation applies):
+#   docker run --rm -it -p 8080:8080 \
+#     -v "$(pwd)":/workspace \
+#     -v modelforge-clinical-mcp-target:/workspace/target \
+#     -e MODELFORGE_MCP_BIND=0.0.0.0:8080 \
+#     modelforge-clinical-mcp:dev \
+#     cargo run -p modelforge-clinical-mcp-http
+
+FROM rust:1.89-slim-bookworm
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add clippy rustfmt \
+    && cargo install cargo-watch --locked \
+    && rm -rf /usr/local/cargo/registry/cache
+
+CMD ["cargo", "watch", \
+     "-x", "fmt --check", \
+     "-x", "clippy --workspace --all-targets -- -D warnings", \
+     "-x", "test --workspace"]
